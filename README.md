@@ -90,9 +90,6 @@ cargo build --release
 The program is `target/release/ttpf-viewer` (`.exe` on Windows). On Linux you also need the GTK3 and
 xkbcommon development packages (`sudo apt install libgtk-3-dev libxkbcommon-dev`).
 
-Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`, which builds Windows, Linux and macOS
-binaries and attaches them to a GitHub release.
-
 For development, `TTPF_VIEWER_TEST="out.png;select=12,level=1,light"` makes the app load the given file,
 apply the actions, save its own rendered window to `out.png` and quit.
 
