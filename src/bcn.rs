@@ -1,0 +1,208 @@
+//! Texture formats and decoding to RGBA8.
+
+use crate::tile::{self, Tile};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fmt {
+    BC1,
+    BC3,
+    BC4,
+    BC5,
+    /// HDR (half-float) colour; shown clipped to 0..1
+    BC6H,
+    BC7,
+    /// One channel, shown as grey.
+    R8,
+    /// Alpha only, shown as grey.
+    A8,
+    BC2,
+    /// BC6H with signed values
+    BC6HS,
+    /// Uncompressed colour (blue first).
+    BGRA8,
+    /// Uncompressed colour (red first).
+    RGBA8,
+    /// 16-bit float, one channel, shown as grey scaled to its own range.
+    R16F,
+    /// 16-bit float RGBA, shown clipped to 0..1.
+    RGBA16F,
+    /// 16-bit RGBA.
+    RGBA16,
+}
+
+impl Fmt {
+    /// Bytes per element (a 4x4 block for BCn, a pixel otherwise).
+    pub fn bytes(self) -> usize {
+        match self {
+            Fmt::BC1 | Fmt::BC4 => 8,
+            Fmt::BC2 | Fmt::BC3 | Fmt::BC5 | Fmt::BC6H | Fmt::BC6HS | Fmt::BC7 => 16,
+            Fmt::R8 | Fmt::A8 => 1,
+            Fmt::R16F => 2,
+            Fmt::BGRA8 | Fmt::RGBA8 => 4,
+            Fmt::RGBA16F | Fmt::RGBA16 => 8,
+        }
+    }
+    /// Pixels per element side: 4 for block-compressed formats, 1 for uncompressed.
+    pub fn block(self) -> usize {
+        match self {
+            Fmt::R8 | Fmt::A8 | Fmt::BGRA8 | Fmt::RGBA8 | Fmt::R16F | Fmt::RGBA16F | Fmt::RGBA16 => 1,
+            _ => 4,
+        }
+    }
+    /// Size of the tile in pixels.
+    pub fn tile_px(self, tile: Tile) -> (usize, usize) {
+        let p = tile.pattern(self.bytes());
+        if p.is_empty() {
+            return (self.block(), self.block()); // tile pattern unknown
+        }
+        let (tw, th) = tile::tile_elems(p);
+        (tw * self.block(), th * self.block())
+    }
+}
+
+/// A decoded image, RGBA8, row-major.
+#[derive(Clone)]
+pub struct Rgba {
+    pub w: usize,
+    pub h: usize,
+    pub px: Vec<u8>,
+}
+
+/// Decode `data` as `fmt` at `w` x `h` pixels (a multiple of the tile size) using the given tile layout.
+pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<Rgba> {
+    let (b, bytes) = (fmt.block(), fmt.bytes());
+    let (we, he) = (w / b, h / b);
+    let n = data.len() / bytes;
+    if we == 0 || he == 0 || we * he != n {
+        return None;
+    }
+    let pat = tile.pattern(bytes);
+    let lin = if pat.is_empty() {
+        // tile pattern not known: only a texture whose elements are all equal can be decoded exactly
+        let first = data.get(..bytes)?;
+        if !data.chunks_exact(bytes).all(|p| p == first) {
+            return None;
+        }
+        first.repeat(n)
+    } else {
+        tile::untile(&data[..n * bytes], bytes, we, he, pat)
+    };
+    if b == 1 {
+        return Some(Rgba { w, h, px: pixels(&lin, fmt) });
+    }
+    let mut px = vec![0u8; w * h * 4];
+    let mut blk = [0u32; 16];
+    for by in 0..he {
+        for bx in 0..we {
+            let s = &lin[(by * we + bx) * bytes..(by * we + bx + 1) * bytes];
+            blk.fill(u32::from_le_bytes([0, 0, 0, 255]));
+            match fmt {
+                Fmt::BC1 => texture2ddecoder::decode_bc1a_block(s, &mut blk),
+                Fmt::BC3 => texture2ddecoder::decode_bc3_block(s, &mut blk),
+                Fmt::BC4 => texture2ddecoder::decode_bc4_block(s, &mut blk),
+                Fmt::BC5 => texture2ddecoder::decode_bc5_block(s, &mut blk),
+                Fmt::BC6H => texture2ddecoder::decode_bc6_block_unsigned(s, &mut blk),
+                Fmt::BC6HS => texture2ddecoder::decode_bc6_block_signed(s, &mut blk),
+                Fmt::BC2 => texture2ddecoder::decode_bc2_block(s, &mut blk),
+                Fmt::BC7 => texture2ddecoder::decode_bc7_block(s, &mut blk),
+                _ => unreachable!(),
+            }
+            for (k, v) in blk.iter().enumerate() {
+                let [bb, g, r, a] = v.to_le_bytes(); // the decoder packs BGRA
+                let (r, g, bb, a) = match fmt {
+                    Fmt::BC4 => (r, r, r, 255), // grey
+                    Fmt::BC5 => (r, g, 0, 255), // two channels, blue = 0
+                    _ => (r, g, bb, a),
+                };
+                let o = ((by * 4 + k / 4) * w + bx * 4 + k % 4) * 4;
+                px[o..o + 4].copy_from_slice(&[r, g, bb, a]);
+            }
+        }
+    }
+    Some(Rgba { w, h, px })
+}
+
+fn half(h: u16) -> f32 {
+    let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+    let v = if e == 0 {
+        m / 1024.0 * 2f32.powi(-14)
+    } else if e == 31 {
+        f32::INFINITY
+    } else {
+        (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    };
+    if s == 1 { -v } else { v }
+}
+
+/// Uncompressed elements (one per pixel) to RGBA8.
+fn pixels(lin: &[u8], fmt: Fmt) -> Vec<u8> {
+    let to8 = |f: f32| (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    match fmt {
+        Fmt::R8 | Fmt::A8 => lin.iter().flat_map(|&v| [v, v, v, 255]).collect(),
+        Fmt::BGRA8 => lin.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect(),
+        Fmt::RGBA8 => lin.to_vec(),
+        Fmt::RGBA16 => lin.chunks_exact(8).flat_map(|p| [p[1], p[3], p[5], p[7]]).collect(),
+        Fmt::RGBA16F => lin
+            .chunks_exact(8)
+            .flat_map(|p| [0, 2, 4, 6].map(|i| to8(half(u16::from_le_bytes([p[i], p[i + 1]])))))
+            .collect(),
+        Fmt::R16F => {
+            // heights and the like: scale the texture's own range to black..white
+            let v: Vec<f32> = lin.chunks_exact(2).map(|p| half(u16::from_le_bytes([p[0], p[1]]))).collect();
+            let (lo, hi) = v.iter().filter(|x| x.is_finite()).fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+            let span = if hi > lo { hi - lo } else { 1.0 };
+            v.iter()
+                .flat_map(|&x| {
+                    let g = to8((x - lo) / span);
+                    [g, g, g, 255]
+                })
+                .collect()
+        }
+        _ => unreachable!(),
+    }
+}
+
+impl Rgba {
+    /// Box-filter downscale so the longest side is at most `max` (never upscales).
+    pub fn thumbnail(&self, max: usize) -> Rgba {
+        let s = (self.w.max(self.h) as f32 / max as f32).max(1.0);
+        let (tw, th) = (((self.w as f32 / s).round() as usize).max(1), ((self.h as f32 / s).round() as usize).max(1));
+        if tw == self.w && th == self.h {
+            return self.clone();
+        }
+        let mut px = vec![0u8; tw * th * 4];
+        for ty in 0..th {
+            let (y0, y1) = (ty * self.h / th, ((ty + 1) * self.h / th).max(ty * self.h / th + 1));
+            for tx in 0..tw {
+                let (x0, x1) = (tx * self.w / tw, ((tx + 1) * self.w / tw).max(tx * self.w / tw + 1));
+                let mut acc = [0u32; 4];
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let o = (y * self.w + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += self.px[o + c] as u32;
+                        }
+                    }
+                }
+                let n = ((y1 - y0) * (x1 - x0)) as u32;
+                let o = (ty * tw + tx) * 4;
+                for c in 0..4 {
+                    px[o + c] = (acc[c] / n) as u8;
+                }
+            }
+        }
+        Rgba { w: tw, h: th, px }
+    }
+
+    /// The top-left `w` x `h` part (removes tile padding).
+    pub fn crop(&self, w: usize, h: usize) -> Rgba {
+        if (self.w, self.h) == (w, h) {
+            return self.clone();
+        }
+        let mut px = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            px.extend_from_slice(&self.px[y * self.w * 4..y * self.w * 4 + w * 4]);
+        }
+        Rgba { w, h, px }
+    }
+}
