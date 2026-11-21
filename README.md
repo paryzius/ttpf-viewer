@@ -16,7 +16,7 @@ Grab `ttpf-viewer-windows-x64.exe` from the [Releases](../../releases) page. It'
 | | |
 |---|---|
 | Open a file | drag it onto the window, click **Open .ttpf…**, or `ttpf-viewer FILE.ttpf` |
-| Browse a folder | **Open folder…** (or drop a folder): its `.ttpf` files appear in a sidebar; click one to open it. **Search all…** finds textures in every file of the folder (click a result to jump to it); **Extract all…** saves every file's textures, one folder per file |
+| Browse a folder | **Open folder…** (or drop a folder): its `.ttpf` files appear in a sidebar; click one to open it. **Search all…** finds textures in every file of the folder, shown as pictures or a list (click one to jump to it); **Extract all…** saves every file's textures, one folder per file |
 | Select | click; **Ctrl**+click to add; **Shift**+click for a range; **Ctrl+A** all; arrow keys to move |
 | Preview | mouse wheel zooms, drag pans, double-click fits; click a mip level below the image to view it |
 | Extract | **Extract selected** or **Extract all shown**: `<number>.png` files go into a folder named after the archive. Pick **DDS** next to the buttons (or **Save DDS…** for one texture) to get the original data instead: lossless, with its BCn compression, HDR values and mip levels |

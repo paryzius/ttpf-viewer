@@ -145,6 +145,8 @@ enum Done {
     Cube(usize, Result<Arc<[Rgba; 6]>, String>, u32),
     /// a status-bar message from background work, and a folder to offer opening
     Message(String, Option<PathBuf>),
+    /// thumbnail of folder-search result n, made for search number `u32`
+    FThumb(usize, Result<ColorImage, String>, u32),
 }
 
 /// Put an image on the clipboard.
@@ -246,6 +248,12 @@ pub struct App {
     funavailable: bool,
     fsearch: Option<crate::folder::Task<crate::folder::Found>>,
     found: Option<crate::folder::Found>,
+    /// folder-search results as pictures (else a list), their thumbnails, and which search they belong to
+    fimages: bool,
+    fthumbs: HashMap<usize, TextureHandle>,
+    fpending: HashSet<usize>,
+    ffailed: HashMap<usize, String>,
+    fgen: u32,
     /// extracting the whole sidebar folder, and where to
     fexport: Option<(crate::folder::Task<Result<crate::folder::Extracted, String>>, PathBuf)>,
     /// texture to select once the archive being opened has loaded
@@ -355,6 +363,11 @@ impl App {
             funavailable: false,
             fsearch: None,
             found: None,
+            fimages: true,
+            fthumbs: HashMap::new(),
+            fpending: HashSet::new(),
+            ffailed: HashMap::new(),
+            fgen: 0,
             fexport: None,
             pending_focus: None,
             message: None,
@@ -426,6 +439,20 @@ impl App {
             match d {
                 Done::Thumb(_, _, g) | Done::Full(_, _, g) | Done::Cube(_, _, g) if g != self.hdr_gen => {}
                 Done::Message(m, dir) => self.message = Some((m, dir)),
+                Done::FThumb(n, r, g) => {
+                    if g == self.fgen {
+                        self.fpending.remove(&n);
+                        match r {
+                            Ok(img) => {
+                                let t = ctx.load_texture(format!("f{g}_{n}"), img, texture_options());
+                                self.fthumbs.insert(n, t);
+                            }
+                            Err(e) => {
+                                self.ffailed.insert(n, e);
+                            }
+                        }
+                    }
+                }
                 Done::Cube(t, r, _) => {
                     if let Some(c) = self.cube3d.as_mut().filter(|c| c.t == t) {
                         match r {
@@ -661,6 +688,7 @@ impl App {
         });
         if go && !running {
             self.found = None;
+            self.clear_fthumbs();
             self.fsearch = Some(crate::folder::search(dir.clone(), self.fquery.clone(), self.fshow, self.funavailable));
         }
         if let Some(t) = &self.fsearch {
@@ -674,8 +702,28 @@ impl App {
         if found.failed > 0 {
             info += &format!(", {} files couldn't be opened", found.failed);
         }
-        ui.label(info);
+        ui.horizontal(|ui| {
+            ui.label(info);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.selectable_value(&mut self.fimages, false, "List");
+                ui.selectable_value(&mut self.fimages, true, "Images");
+            });
+        });
         ui.separator();
+        if self.fimages {
+            let found = self.found.take();
+            if let Some(f) = &found {
+                if let Some(pick) = self.search_grid(ui, f) {
+                    let (path, i) = (f.hits[pick].path.clone(), f.hits[pick].index);
+                    self.found = found;
+                    self.go_to(path, i, ctx);
+                    return;
+                }
+            }
+            self.found = found;
+            return;
+        }
+        let Some(found) = &self.found else { return };
         let mut pick = None;
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, found.hits.len(), |ui, range| {
@@ -692,13 +740,83 @@ impl App {
             }
         });
         if let Some((path, i)) = pick {
-            if self.open_path.as_ref() == Some(&path) && self.arc.is_some() {
-                self.focus_texture(i);
-            } else {
-                self.open(path, ctx);
-                self.pending_focus = Some(i);
-            }
+            self.go_to(path, i, ctx);
         }
+    }
+
+    /// Open `path` (if it isn't already) and select texture `i`.
+    fn go_to(&mut self, path: PathBuf, i: usize, ctx: &egui::Context) {
+        if self.open_path.as_ref() == Some(&path) && self.arc.is_some() {
+            self.focus_texture(i);
+        } else {
+            self.open(path, ctx);
+            self.pending_focus = Some(i);
+        }
+    }
+
+    fn clear_fthumbs(&mut self) {
+        self.fgen += 1;
+        self.fthumbs.clear();
+        self.fpending.clear();
+        self.ffailed.clear();
+    }
+
+    /// Folder-search results as a grid of pictures. Returns the result clicked.
+    fn search_grid(&mut self, ui: &mut egui::Ui, found: &crate::folder::Found) -> Option<usize> {
+        const CELL: f32 = 128.0;
+        const CAP: f32 = 46.0;
+        let vis = ui.visuals().clone();
+        let gap = ui.spacing().item_spacing;
+        let cols = (((ui.available_width() + gap.x) / (CELL + gap.x)).floor() as usize).max(1);
+        let mut pick = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, CELL + CAP, found.hits.len().div_ceil(cols), |ui, range| {
+            for r in range {
+                ui.horizontal(|ui| {
+                    for n in r * cols..((r + 1) * cols).min(found.hits.len()) {
+                        let h = &found.hits[n];
+                        let (rect, resp) = ui.allocate_exact_size(vec2(CELL, CELL + CAP), Sense::click());
+                        let p = ui.painter_at(rect);
+                        let img = Rect::from_min_size(rect.min, vec2(CELL, CELL));
+                        p.rect_filled(img, 4.0, vis.extreme_bg_color);
+                        if h.note == "unavailable" {
+                            p.text(img.center(), Align2::CENTER_CENTER, "unavailable", FontId::proportional(11.0), vis.weak_text_color());
+                        } else if let Some(th) = self.fthumbs.get(&n) {
+                            let rr = fit_rect(img.shrink(4.0), th.size_vec2());
+                            let id = th.id();
+                            self.checker(&p, rr);
+                            p.image(id, rr, FULL_UV, Color32::WHITE);
+                        } else if let Some(e) = self.ffailed.get(&n) {
+                            p.text(img.center(), Align2::CENTER_CENTER, e, FontId::proportional(11.0), vis.error_fg_color);
+                        } else {
+                            if !self.fpending.contains(&n) {
+                                if let Some(arc) = found.archives.get(&h.path).cloned() {
+                                    self.fpending.insert(n);
+                                    let (done, g, t) = (self.done.clone(), self.fgen, h.index);
+                                    self.pool.push(Box::new(move || {
+                                        let r = arc.best_image(t).map(|i| to_color_image(&i.thumbnail(CELL as usize))).map_err(|p| p.text().to_string());
+                                        done.lock().unwrap().push(Done::FThumb(n, r, g));
+                                    }));
+                                }
+                            }
+                            p.text(img.center(), Align2::CENTER_CENTER, "…", FontId::proportional(16.0), vis.weak_text_color());
+                        }
+                        let current = self.open_path.as_ref() == Some(&h.path) && self.focus == Some(h.index);
+                        let stroke = if current { Stroke::new(3.0, vis.strong_text_color()) } else { vis.widgets.noninteractive.bg_stroke };
+                        p.rect_stroke(img, 4.0, stroke, StrokeKind::Inside);
+                        let x = rect.min.x + 2.0;
+                        p.text(pos2(x, img.max.y + 2.0), Align2::LEFT_TOP, format!("#{}  {}x{}", h.index, h.w, h.h), FontId::proportional(12.0), vis.strong_text_color());
+                        let file = h.path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                        p.text(pos2(x, img.max.y + 17.0), Align2::LEFT_TOP, file, FontId::proportional(10.5), vis.text_color());
+                        p.text(pos2(x, img.max.y + 30.0), Align2::LEFT_TOP, &h.format, FontId::proportional(10.5), vis.weak_text_color());
+                        let resp = resp.on_hover_text(h.path.display().to_string());
+                        if resp.clicked() {
+                            pick = Some(n);
+                        }
+                    }
+                });
+            }
+        });
+        pick
     }
 
     /// Extract every .ttpf of the sidebar folder.
@@ -921,6 +1039,7 @@ impl App {
         let busy = !self.pending.is_empty()
             || self.full_pending.is_some()
             || self.fsearch.is_some()
+            || !self.fpending.is_empty()
             || (self.view3d && self.cube3d.as_ref().is_some_and(|c| c.faces.is_none() && c.error.is_none()));
         let settled = if busy { 1 } else { settled + 1 };
         self.test.as_mut().unwrap().2 = settled;
@@ -1036,7 +1155,7 @@ impl eframe::App for App {
         }
         if self.fwin && self.folder.is_some() {
             let mut open = true;
-            egui::Window::new("Search all files").open(&mut open).default_size([560.0, 520.0]).show(&ctx, |ui| self.search_window(ui, &ctx));
+            egui::Window::new("Search all files").open(&mut open).default_size([760.0, 620.0]).show(&ctx, |ui| self.search_window(ui, &ctx));
             self.fwin = open;
         }
         if self.focus.is_some() && self.arc.is_some() {
@@ -1165,6 +1284,7 @@ impl App {
                     self.full = None;
                     self.full_pending = None;
                     self.cube3d = None;
+                    self.clear_fthumbs();
                 }
                 ui.separator();
             }

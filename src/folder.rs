@@ -2,6 +2,7 @@
 
 use crate::archive::{self, Archive, Progress, Status};
 use crate::gui::{Show, matches};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,6 +80,8 @@ pub struct Found {
     pub files: usize,
     /// files that couldn't be opened
     pub failed: usize,
+    /// the files with results, kept open to show their textures
+    pub archives: HashMap<PathBuf, Arc<Archive>>,
 }
 
 /// Find the textures matching `query` (as typed in the search box) and `show` in every .ttpf under `dir`.
@@ -87,13 +90,14 @@ pub fn search(dir: PathBuf, query: String, show: Show, unavailable: bool) -> Tas
         let files = ttpf_files(&dir);
         total.store(files.len(), Ordering::Relaxed);
         let q = query.trim().trim_start_matches('#').to_lowercase();
-        let mut f = Found { hits: Vec::new(), truncated: false, files: files.len(), failed: 0 };
+        let mut f = Found { hits: Vec::new(), truncated: false, files: files.len(), failed: 0, archives: HashMap::new() };
         for p in files {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             match Archive::open(&p, &Progress::default()) {
                 Ok(a) => {
+                    let before = f.hits.len();
                     for t in a.textures.iter().filter(|t| matches(t, &q, show, unavailable)) {
                         if f.hits.len() == MAX_HITS {
                             f.truncated = true;
@@ -105,6 +109,9 @@ pub fn search(dir: PathBuf, query: String, show: Show, unavailable: bool) -> Tas
                             Status::Unavailable(_) => "unavailable",
                         };
                         f.hits.push(Hit { path: p.clone(), index: t.index, w: t.w, h: t.h, format: t.format_name(), note });
+                    }
+                    if f.hits.len() > before {
+                        f.archives.insert(p.clone(), Arc::new(a));
                     }
                 }
                 Err(_) => f.failed += 1,
