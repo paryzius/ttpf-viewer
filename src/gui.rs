@@ -1037,6 +1037,7 @@ impl App {
                             self.normal_maps.insert(n);
                         }
                     }
+                    Some(("fshow", v)) => self.fshow = Show::from_key(v),
                     Some(("fsearch", q)) => {
                         self.fwin = true;
                         self.fquery = q.replace('+', " ");

@@ -34,6 +34,8 @@ install. On Linux or macOS, [build it from source](#building-from-source).
 - With a folder open, **Search all…** searches every `.ttpf` in it and shows the results as pictures or a list.
   Click one to open it.
 
+![Search all files: cube maps of 256x256 found across a folder, shown as pictures](docs/search.png)
+
 ## Looking at a texture
 
 - Mouse wheel zooms, drag pans, double-click fits. Click a mip level under the image to view it.
@@ -45,6 +47,12 @@ install. On Linux or macOS, [build it from source](#building-from-source).
 - **Normal maps** that store only X and Y (in red and green) use blue for other data, so they look olive.
   Tick **Normal map: rebuild blue** to see them as normal maps; untick it to go back. The archives don't mark
   which textures are normal maps, so this is never done automatically. (BC5 normal maps always get blue rebuilt.)
+
+![The same normal map as stored (olive) and with "Normal map: rebuild blue" ticked](docs/normal-map.png)
+
+The app follows your system's light or dark theme:
+
+![TTPF Viewer in the light theme, showing a cube map's faces and mip levels](docs/light-theme.png)
 
 ## Saving
 
