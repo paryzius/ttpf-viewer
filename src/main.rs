@@ -4,6 +4,7 @@
 mod archive;
 mod bc6h;
 mod bcn;
+mod cube3d;
 mod gui;
 mod layout;
 mod tile;

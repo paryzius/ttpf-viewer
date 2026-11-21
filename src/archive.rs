@@ -542,6 +542,20 @@ impl Archive {
         self.best_image_in(t, 0)
     }
 
+    /// The 6 faces of a cube map at the largest size all of them can supply.
+    pub fn cube_faces(&self, t: usize) -> Result<[Rgba; 6], Problem> {
+        let tex = &self.textures[t];
+        if !tex.cube {
+            return Err(Problem::Layout);
+        }
+        let level = (0..6)
+            .map(|f| tex.layer_levels(f).iter().position(|l| l.state.is_ok()))
+            .try_fold(0, |m, f| f.map(|f| m.max(f)))
+            .ok_or(Problem::Compression)?;
+        let faces: Vec<Rgba> = (0..6).map(|f| self.image_in(t, f, level)).collect::<Result<_, _>>()?;
+        faces.try_into().map_err(|_| Problem::Layout)
+    }
+
     /// A face / slice at its largest readable size.
     pub fn best_image_in(&self, t: usize, layer: usize) -> Result<Rgba, Problem> {
         let tex = &self.textures[t];

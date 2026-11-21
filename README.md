@@ -21,7 +21,7 @@ Grab `ttpf-viewer-windows-x64.exe` from the [Releases](../../releases) page. It'
 | Preview | mouse wheel zooms, drag pans, double-click fits; click a mip level below the image to view it |
 | Extract | **Extract selected** or **Extract all shown**: `<number>.png` files go into a folder named after the archive. Pick **DDS** next to the buttons (or **Save DDS…** for one texture) to get the original data instead: lossless, with its BCn compression, HDR values and mip levels |
 | Find | search by texture number, size (`512x256`) or format (`BC7`); sort by number, size or format, ascending or descending |
-| Cube maps, arrays | pick a face or slice in the strip under the preview. Extracting saves one PNG per face (`<number>_px.png`, `_nx`, `_py`, `_ny`, `_pz`, `_nz`) or slice (`<number>_0.png`, …); DDS keeps them all in one file |
+| Cube maps, arrays | pick a face or slice in the strip under the preview; for cube maps, **3D** shows it from inside (**Look around**, like a sky) or wrapped on a **Sphere**: drag to turn, wheel to zoom, **Up: Z/Y** picks the world's up axis (Z for RAGE games). Extracting saves one PNG per face (`<number>_px.png`, `_nx`, `_py`, `_ny`, `_pz`, `_nz`) or slice (`<number>_0.png`, …); DDS keeps them all in one file |
 | HDR | BC6H and half-float textures are tone-mapped so bright parts keep their detail; switch to **clipped** in the toolbar to see values as stored (`--clip` on the command line) |
 
 Archives open instantly, even multi-gigabyte ones: only the header is read up front, and texture data is

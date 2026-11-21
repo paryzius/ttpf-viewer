@@ -82,6 +82,16 @@ enum Sort {
 enum Done {
     Thumb(Key2, Result<ColorImage, String>, u32),
     Full(Key2, Result<ColorImage, String>, u32),
+    Cube(usize, Result<Arc<[Rgba; 6]>, String>, u32),
+}
+
+/// The 3D view of a cube map: its faces, the camera, and the last rendered picture.
+struct Cube3d {
+    t: usize,
+    faces: Option<Arc<[Rgba; 6]>>,
+    error: Option<String>,
+    view: crate::cube3d::View,
+    shown: Option<(TextureHandle, crate::cube3d::View, [usize; 2])>,
 }
 
 fn to_color_image(img: &Rgba) -> ColorImage {
@@ -138,6 +148,9 @@ pub struct App {
     as_dds: bool,
     /// face / slice shown for a cube map or texture array
     layer: usize,
+    /// cube maps: show the 3D view instead of a face
+    view3d: bool,
+    cube3d: Option<Cube3d>,
     sort: Sort,
     descending: bool,
     /// bumped when the HDR display setting changes, so images decoded with the old one are dropped
@@ -188,6 +201,8 @@ impl App {
             tsize: 160.0,
             as_dds: false,
             layer: 0,
+            view3d: false,
+            cube3d: None,
             sort: Sort::Number,
             descending: false,
             hdr_gen: 0,
@@ -262,7 +277,16 @@ impl App {
         }
         for d in std::mem::take(&mut *self.done.lock().unwrap()) {
             match d {
-                Done::Thumb(_, _, g) | Done::Full(_, _, g) if g != self.hdr_gen => {}
+                Done::Thumb(_, _, g) | Done::Full(_, _, g) | Done::Cube(_, _, g) if g != self.hdr_gen => {}
+                Done::Cube(t, r, _) => {
+                    if let Some(c) = self.cube3d.as_mut().filter(|c| c.t == t) {
+                        match r {
+                            Ok(f) => c.faces = Some(f),
+                            Err(e) => c.error = Some(e),
+                        }
+                        c.shown = None;
+                    }
+                }
                 Done::Thumb(k, r, _) => {
                     self.pending.remove(&k);
                     match r {
@@ -367,6 +391,68 @@ impl App {
                 .map_err(|p| p.text().to_string());
             done.lock().unwrap().push(Done::Full(k, r, g));
         }));
+    }
+
+    /// Draw the 3D view of cube map `t` into `area`, decoding its faces first if needed.
+    fn cube_view(&mut self, ui: &egui::Ui, p: &egui::Painter, area: Rect, resp: &egui::Response, t: usize) {
+        let vis = ui.visuals().clone();
+        if self.cube3d.as_ref().is_none_or(|c| c.t != t) {
+            let view = self.cube3d.as_ref().map(|c| c.view).unwrap_or_default();
+            self.cube3d = Some(Cube3d { t, faces: None, error: None, view: crate::cube3d::View { sphere: view.sphere, z_up: view.z_up, ..Default::default() }, shown: None });
+        }
+        let Some(arc) = self.arc.clone() else { return };
+        let c = self.cube3d.as_mut().unwrap();
+        if let Some(e) = &c.error {
+            p.text(area.center(), Align2::CENTER_CENTER, format!("Can't show in 3D: {e}"), FontId::proportional(15.0), vis.error_fg_color);
+            return;
+        }
+        let Some(faces) = c.faces.clone() else {
+            if c.shown.is_none() {
+                // first request: decode the 6 faces in the background (marker: a dummy shown entry)
+                c.shown = Some((ui.ctx().load_texture("cube", ColorImage::new([1, 1], vec![Color32::TRANSPARENT]), texture_options()), c.view, [0, 0]));
+                let (done, g) = (self.done.clone(), self.hdr_gen);
+                self.pool.push(Box::new(move || {
+                    let r = arc.cube_faces(t).map(Arc::new).map_err(|p| p.text().to_string());
+                    done.lock().unwrap().push(Done::Cube(t, r, g));
+                }));
+            }
+            p.text(area.center(), Align2::CENTER_CENTER, "Decoding faces…", FontId::proportional(16.0), vis.weak_text_color());
+            return;
+        };
+        // drag turns, wheel zooms
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let k = if c.view.sphere { -0.008 } else { 0.004 * c.view.fov };
+            c.view.yaw -= d.x * k;
+            c.view.pitch = (c.view.pitch + d.y * k).clamp(-1.55, 1.55);
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                c.view.fov = (c.view.fov * (-scroll * 0.0015).exp()).clamp(15f32.to_radians(), 150f32.to_radians());
+            }
+        }
+        // render at most ~800 px wide, scaled up to the area
+        let s = (800.0 / area.width()).min(1.0);
+        let size = [((area.width() * s) as usize).max(16), ((area.height() * s) as usize).max(16)];
+        let stale = c.shown.as_ref().is_none_or(|(_, v, sz)| *v != c.view || *sz != size);
+        if stale {
+            let px = crate::cube3d::render(&faces, c.view, size[0], size[1]);
+            let img = ColorImage::from_rgba_unmultiplied(size, &px);
+            let opts = TextureOptions { magnification: TextureFilter::Linear, ..texture_options() };
+            match &mut c.shown {
+                Some((th, v, sz)) if *sz != [0, 0] => {
+                    th.set(img, opts);
+                    *v = c.view;
+                    *sz = size;
+                }
+                _ => c.shown = Some((ui.ctx().load_texture("cube", img, opts), c.view, size)),
+            }
+        }
+        let (th, _, _) = c.shown.as_ref().unwrap();
+        p.image(th.id(), area, FULL_UV, Color32::WHITE);
+        let hint = if c.view.sphere { "drag: turn the ball   wheel: zoom" } else { "drag: look around   wheel: zoom" };
+        p.text(area.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, hint, FontId::proportional(12.0), vis.text_color());
     }
 
     fn select_click(&mut self, t: usize, ctrl: bool, shift: bool) {
@@ -505,6 +591,20 @@ impl App {
                     _ if a == "unavailable" => self.show_unavailable = true,
                     _ if a == "light" => ctx.set_theme(egui::Theme::Light),
                     _ if a == "desc" => self.descending = true,
+                    _ if a == "3d" => self.view3d = true,
+                    _ if a == "yup" => {
+                        let t = self.focus.unwrap_or(0);
+                        self.cube3d.get_or_insert_with(|| Cube3d { t, faces: None, error: None, view: Default::default(), shown: None }).view.z_up = false;
+                    }
+                    _ if a == "sphere" || a.starts_with("yaw=") => {
+                        let t = self.focus.unwrap_or(0);
+                        let c = self.cube3d.get_or_insert_with(|| Cube3d { t, faces: None, error: None, view: Default::default(), shown: None });
+                        if a == "sphere" {
+                            c.view.sphere = true;
+                        } else {
+                            c.view.yaw = a[4..].parse::<f32>().unwrap_or(0.0).to_radians();
+                        }
+                    }
                     _ if a == "clip" => crate::bcn::TONEMAP.store(false, Ordering::Relaxed),
                     Some(("sort", v)) => {
                         self.sort = match v {
@@ -517,7 +617,9 @@ impl App {
                 }
             }
         }
-        let busy = !self.pending.is_empty() || self.full_pending.is_some();
+        let busy = !self.pending.is_empty()
+            || self.full_pending.is_some()
+            || (self.view3d && self.cube3d.as_ref().is_some_and(|c| c.faces.is_none() && c.error.is_none()));
         let settled = if busy { 1 } else { settled + 1 };
         self.test.as_mut().unwrap().2 = settled;
         if settled > 20 {
@@ -713,6 +815,7 @@ impl App {
                     self.failed.clear();
                     self.full = None;
                     self.full_pending = None;
+                    self.cube3d = None;
                 }
                 ui.separator();
             }
@@ -914,13 +1017,34 @@ impl App {
                 ui.colored_label(vis.warn_fg_color, format!("Can't show this texture: {}.", prob.text()));
             }
         }
+        if tex.cube {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view3d, false, "Faces");
+                ui.selectable_value(&mut self.view3d, true, "3D").on_hover_text("See the cube map in 3D");
+                if self.view3d {
+                    let view = &mut self.cube3d.get_or_insert_with(|| Cube3d { t, faces: None, error: None, view: Default::default(), shown: None }).view;
+                    ui.separator();
+                    ui.selectable_value(&mut view.sphere, false, "Look around").on_hover_text("From inside, like a sky");
+                    ui.selectable_value(&mut view.sphere, true, "Sphere").on_hover_text("Wrapped on a ball");
+                    ui.separator();
+                    ui.label("Up:");
+                    ui.selectable_value(&mut view.z_up, true, "Z").on_hover_text("Z is up, as in RAGE games");
+                    ui.selectable_value(&mut view.z_up, false, "Y").on_hover_text("Y is up, the Direct3D convention");
+                    if ui.small_button("Reset").clicked() {
+                        *view = crate::cube3d::View { sphere: view.sphere, z_up: view.z_up, ..Default::default() };
+                    }
+                }
+            });
+        }
         // image with zoom / pan
-        let below = 110.0 + 120.0 + if tex.layer_count() > 1 { MIP_THUMB as f32 + 42.0 } else { 0.0 };
+        let below = 110.0 + 120.0 + if tex.layer_count() > 1 { MIP_THUMB as f32 + 42.0 } else { 0.0 } + if tex.cube { 24.0 } else { 0.0 };
         let area_size = vec2(ui.available_width(), (ui.available_height() - below).max(200.0));
         let (area, resp) = ui.allocate_exact_size(area_size, Sense::click_and_drag());
         let p = ui.painter_at(area);
         p.rect_filled(area, 4.0, vis.extreme_bg_color);
-        if let Some(l) = level {
+        if tex.cube && self.view3d {
+            self.cube_view(ui, &p, area, &resp, t);
+        } else if let Some(l) = level {
             let k = (t, layer, l);
             self.request_full(k);
             let shown = self.full.as_ref().filter(|f| f.0 == k).map(|f| f.1.clone());
