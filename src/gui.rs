@@ -69,9 +69,18 @@ impl Pool {
 /// (texture, mip level)
 type Key2 = (usize, usize);
 
+/// Gallery order.
+#[derive(Clone, Copy, PartialEq)]
+enum Sort {
+    Number,
+    Size,
+    Format,
+}
+
+/// Decoded images; the last field is the HDR setting generation they were made with.
 enum Done {
-    Thumb(Key2, Result<ColorImage, String>),
-    Full(Key2, Result<ColorImage, String>),
+    Thumb(Key2, Result<ColorImage, String>, u32),
+    Full(Key2, Result<ColorImage, String>, u32),
 }
 
 fn to_color_image(img: &Rgba) -> ColorImage {
@@ -126,6 +135,10 @@ pub struct App {
     tsize: f32,
     /// extract as .dds (original data) instead of .png
     as_dds: bool,
+    sort: Sort,
+    descending: bool,
+    /// bumped when the HDR display setting changes, so images decoded with the old one are dropped
+    hdr_gen: u32,
     cols: usize,
     scroll_y: f32,
     // preview zoom/pan
@@ -171,6 +184,9 @@ impl App {
             search: String::new(),
             tsize: 160.0,
             as_dds: false,
+            sort: Sort::Number,
+            descending: false,
+            hdr_gen: 0,
             cols: 1,
             scroll_y: 0.0,
             zoom: 1.0,
@@ -241,7 +257,8 @@ impl App {
         }
         for d in std::mem::take(&mut *self.done.lock().unwrap()) {
             match d {
-                Done::Thumb(k, r) => {
+                Done::Thumb(_, _, g) | Done::Full(_, _, g) if g != self.hdr_gen => {}
+                Done::Thumb(k, r, _) => {
                     self.pending.remove(&k);
                     match r {
                         Ok(img) => {
@@ -253,7 +270,7 @@ impl App {
                         }
                     }
                 }
-                Done::Full(k, r) => {
+                Done::Full(k, r, _) => {
                     if self.full_pending == Some(k) {
                         self.full_pending = None;
                         match r {
@@ -307,6 +324,15 @@ impl App {
             })
             .map(|t| t.index)
             .collect();
+        let t = &arc.textures;
+        match self.sort {
+            Sort::Number => {}
+            Sort::Size => self.rows.sort_by_key(|&i| (t[i].w * t[i].h, t[i].w, i)),
+            Sort::Format => self.rows.sort_by_cached_key(|&i| (t[i].format_name(), i)),
+        }
+        if self.descending {
+            self.rows.reverse();
+        }
     }
 
     fn request_thumb(&mut self, k: Key2, size: usize) {
@@ -315,10 +341,10 @@ impl App {
         }
         let Some(arc) = self.arc.clone() else { return };
         self.pending.insert(k);
-        let done = self.done.clone();
+        let (done, g) = (self.done.clone(), self.hdr_gen);
         self.pool.push(Box::new(move || {
             let r = arc.image(k.0, k.1).map(|img| to_color_image(&img.thumbnail(size))).map_err(|p| p.text().to_string());
-            done.lock().unwrap().push(Done::Thumb(k, r));
+            done.lock().unwrap().push(Done::Thumb(k, r, g));
         }));
     }
 
@@ -328,13 +354,13 @@ impl App {
         }
         let Some(arc) = self.arc.clone() else { return };
         self.full_pending = Some(k);
-        let done = self.done.clone();
+        let (done, g) = (self.done.clone(), self.hdr_gen);
         self.pool.push(Box::new(move || {
             let r = arc
                 .image(k.0, k.1)
                 .map(|img| to_color_image(&if img.w.max(img.h) > 8192 { img.thumbnail(8192) } else { img }))
                 .map_err(|p| p.text().to_string());
-            done.lock().unwrap().push(Done::Full(k, r));
+            done.lock().unwrap().push(Done::Full(k, r, g));
         }));
     }
 
@@ -470,6 +496,15 @@ impl App {
                     Some(("size", n)) => self.tsize = n.parse().unwrap_or(self.tsize),
                     _ if a == "unavailable" => self.show_unavailable = true,
                     _ if a == "light" => ctx.set_theme(egui::Theme::Light),
+                    _ if a == "desc" => self.descending = true,
+                    _ if a == "clip" => crate::bcn::TONEMAP.store(false, Ordering::Relaxed),
+                    Some(("sort", v)) => {
+                        self.sort = match v {
+                            "size" => Sort::Size,
+                            "format" => Sort::Format,
+                            _ => Sort::Number,
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -625,10 +660,54 @@ impl App {
             ui.separator();
             ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search: number, 512x256, BC7").desired_width(190.0));
             ui.separator();
+            egui::ComboBox::from_id_salt("sort")
+                .width(90.0)
+                .selected_text(match self.sort {
+                    Sort::Number => "Sort: number",
+                    Sort::Size => "Sort: size",
+                    Sort::Format => "Sort: format",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.sort, Sort::Number, "Number");
+                    ui.selectable_value(&mut self.sort, Sort::Size, "Size (pixels)");
+                    ui.selectable_value(&mut self.sort, Sort::Format, "Format");
+                });
+            if ui
+                .button(if self.descending { "Descending" } else { "Ascending" })
+                .on_hover_text("Reverse the order")
+                .clicked()
+            {
+                self.descending = !self.descending;
+            }
+            ui.separator();
             ui.label("Size");
             ui.add(egui::Slider::new(&mut self.tsize, 64.0..=384.0).show_value(false));
             ui.separator();
             let busy = self.export.is_some();
+            if self.arc.as_ref().is_some_and(|a| a.textures.iter().any(|t| t.fmt.is_some_and(|f| f.is_hdr()))) {
+                let mut tm = crate::bcn::TONEMAP.load(Ordering::Relaxed);
+                let before = tm;
+                egui::ComboBox::from_id_salt("hdr")
+                    .width(110.0)
+                    .selected_text(if tm { "HDR: tone-mapped" } else { "HDR: clipped" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut tm, true, "Tone-mapped").on_hover_text("Bright values roll off smoothly, so detail above white stays visible");
+                        ui.selectable_value(&mut tm, false, "Clipped").on_hover_text("Values shown as stored; anything brighter than white is white");
+                    })
+                    .response
+                    .on_hover_text("How BC6H and half-float textures are shown and saved as PNG (DDS always keeps the original values)");
+                if tm != before && !busy {
+                    crate::bcn::TONEMAP.store(tm, Ordering::Relaxed);
+                    self.hdr_gen += 1;
+                    self.pool.clear();
+                    self.thumbs.clear();
+                    self.pending.clear();
+                    self.failed.clear();
+                    self.full = None;
+                    self.full_pending = None;
+                }
+                ui.separator();
+            }
             egui::ComboBox::from_id_salt("as")
                 .width(60.0)
                 .selected_text(if self.as_dds { "DDS" } else { "PNG" })

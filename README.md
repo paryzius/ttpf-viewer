@@ -20,7 +20,8 @@ Grab `ttpf-viewer-windows-x64.exe` from the [Releases](../../releases) page. It'
 | Select | click; **Ctrl**+click to add; **Shift**+click for a range; **Ctrl+A** all; arrow keys to move |
 | Preview | mouse wheel zooms, drag pans, double-click fits; click a mip level below the image to view it |
 | Extract | **Extract selected** or **Extract all shown**: `<number>.png` files go into a folder named after the archive. Pick **DDS** next to the buttons (or **Save DDS…** for one texture) to get the original data instead: lossless, with its BCn compression, HDR values and mip levels |
-| Find | search by texture number, size (`512x256`) or format (`BC7`) |
+| Find | search by texture number, size (`512x256`) or format (`BC7`); sort by number, size or format, ascending or descending |
+| HDR | BC6H and half-float textures are tone-mapped so bright parts keep their detail; switch to **clipped** in the toolbar to see values as stored (`--clip` on the command line) |
 
 Archives open instantly, even multi-gigabyte ones: only the header is read up front, and texture data is
 unpacked when it is shown or exported.
@@ -33,8 +34,11 @@ unpacked when it is shown or exported.
   **Show unavailable**.
 - **Cut off**: parts missing from a partially downloaded archive.
 - **Unsupported format**: any DXGI format not listed below.
+- **Cube maps and texture arrays** (about 700 textures, mostly in `lighting.ttpf`): they hold several images (6 faces,
+  or slices) in their own layout, so only part of one image is shown for now.
 
-Supported formats: BC1, BC2, BC3, BC4, BC5, BC6H (unsigned and signed, shown clipped to 0..1), BC7, R8, A8,
+Supported formats: BC1, BC2, BC3, BC4, BC5 (blue rebuilt from red and green, as for normal maps), BC6H (unsigned
+and signed), BC7, R8, A8,
 R16_FLOAT (shown as grey scaled to its own range, e.g. heightmaps), R8G8B8A8, B8G8R8A8, R16G16B16A16.
 
 ### Command line
@@ -59,7 +63,8 @@ then, at the ETPF position:
       "ETPF", u32 ?, u32 number of textures, u32 section size
       16 bytes per texture:
         dword0  bits  0-13 width-1, 14-27 height-1
-        dword1  bits  0-9  DXGI format << 3 | flags, bits 24-25 tile mode (0 = 64 KB tiles, else 4 KB)
+        dword1  bits  0-9  DXGI format << 3 | flags, bits 10-19 array size - 1,
+                bits 24-27 tile mode (0 = 64 KB tiles, 1-3 = 4 KB, 9-12 = 4 KB cube maps)
         dword2  bits  0-20 start of the texture in the unpacked data / 4096
       then a sorted list of 8-byte name hashes
 ```
@@ -85,11 +90,13 @@ apply the actions, save its own rendered window to `out.png` and quit.
 ## Credits
 
 - [egui / eframe](https://github.com/emilk/egui) for the interface
-- [texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder) for BCn decoding
+- [texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder) for BCn decoding; `src/bc6h.rs` is its BC6H decoder
+  adapted to keep HDR values (MIT, notice in the file)
 - [rfd](https://github.com/PolyMeilex/rfd), [image](https://github.com/image-rs/image), [flate2](https://github.com/rust-lang/flate2-rs), [rayon](https://github.com/rayon-rs/rayon), [memmap2](https://github.com/RazrFalcon/memmap2-rs)
 
 - [Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars) and [PercyStar](https://github.com/rpatty-dev/PercyStar) (by rpatty-dev),
-  whose research showed how the block table encodes block ends and storage types; this app's code is its own
+  whose research showed how the block table encodes block ends and storage types, and
+  [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) for the descriptor fields; this app's code is its own
 
 ## License
 

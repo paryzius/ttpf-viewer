@@ -300,12 +300,14 @@ impl Archive {
 
         // textures
         progress.stage("Reading texture table…");
-        let mut raw: Vec<(usize, usize, usize, u32, Tile, usize)> = (0..count)
+        let mut raw: Vec<(usize, usize, usize, u32, Tile, usize, usize)> = (0..count)
             .map(|i| {
                 let o = at + 16 + 16 * i;
                 let (a, b, c) = (u32_at(d, o).unwrap(), u32_at(d, o + 4).unwrap(), u32_at(d, o + 8).unwrap());
-                let tile = if (b >> 24) & 3 == 0 { Tile::T64K } else { Tile::T4K };
-                (i, (a & 0x3fff) as usize + 1, ((a >> 14) & 0x3fff) as usize + 1, (b & 0x3ff) >> 3, tile, (c & 0x1f_ffff) as usize * 4096)
+                // tile mode 0 = 64 KB tiles; 1-3 (and 9-12 on cube maps) = 4 KB tiles
+                let tile = if (b >> 24) & 0xf == 0 { Tile::T64K } else { Tile::T4K };
+                let mips = (a >> 28) as usize + 1;
+                (i, (a & 0x3fff) as usize + 1, ((a >> 14) & 0x3fff) as usize + 1, (b & 0x3ff) >> 3, tile, (c & 0x1f_ffff) as usize * 4096, mips)
             })
             .collect();
         let mut by_start: Vec<usize> = (0..raw.len()).collect();
@@ -325,7 +327,7 @@ impl Archive {
         };
         let textures: Vec<Texture> = raw
             .drain(..)
-            .map(|(index, w, h, dxgi, tile, start)| {
+            .map(|(index, w, h, dxgi, tile, start, _mips)| {
                 let fmt = format_of(dxgi);
                 let levels = fmt.map(|f| arc.levels(f, tile, w, h, start, ends[index])).unwrap_or_default();
                 let status = match (fmt, levels.iter().position(|l| l.state.is_ok())) {

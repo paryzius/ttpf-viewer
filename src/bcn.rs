@@ -98,17 +98,25 @@ pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<R
     }
     let mut px = vec![0u8; w * h * 4];
     let mut blk = [0u32; 16];
+    let mut hdr = [[0u16; 3]; 16];
     for by in 0..he {
         for bx in 0..we {
             let s = &lin[(by * we + bx) * bytes..(by * we + bx + 1) * bytes];
+            if matches!(fmt, Fmt::BC6H | Fmt::BC6HS) {
+                // HDR: decode the real values and tone-map them instead of clipping
+                crate::bc6h::decode_block(s, &mut hdr, fmt == Fmt::BC6HS);
+                for (k, c) in hdr.iter().enumerate() {
+                    let o = ((by * 4 + k / 4) * w + bx * 4 + k % 4) * 4;
+                    px[o..o + 4].copy_from_slice(&[tonemap(half(c[0])), tonemap(half(c[1])), tonemap(half(c[2])), 255]);
+                }
+                continue;
+            }
             blk.fill(u32::from_le_bytes([0, 0, 0, 255]));
             match fmt {
                 Fmt::BC1 => texture2ddecoder::decode_bc1a_block(s, &mut blk),
                 Fmt::BC3 => texture2ddecoder::decode_bc3_block(s, &mut blk),
                 Fmt::BC4 => texture2ddecoder::decode_bc4_block(s, &mut blk),
                 Fmt::BC5 => texture2ddecoder::decode_bc5_block(s, &mut blk),
-                Fmt::BC6H => texture2ddecoder::decode_bc6_block_unsigned(s, &mut blk),
-                Fmt::BC6HS => texture2ddecoder::decode_bc6_block_signed(s, &mut blk),
                 Fmt::BC2 => texture2ddecoder::decode_bc2_block(s, &mut blk),
                 Fmt::BC7 => texture2ddecoder::decode_bc7_block(s, &mut blk),
                 _ => unreachable!(),
@@ -117,7 +125,7 @@ pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<R
                 let [bb, g, r, a] = v.to_le_bytes(); // the decoder packs BGRA
                 let (r, g, bb, a) = match fmt {
                     Fmt::BC4 => (r, r, r, 255), // grey
-                    Fmt::BC5 => (r, g, 0, 255), // two channels, blue = 0
+                    Fmt::BC5 => (r, g, normal_z(r, g), 255), // two-channel normal map: rebuild blue (z)
                     _ => (r, g, bb, a),
                 };
                 let o = ((by * 4 + k / 4) * w + bx * 4 + k % 4) * 4;
@@ -126,6 +134,39 @@ pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<R
         }
     }
     Some(Rgba { w, h, px })
+}
+
+/// How HDR textures (BC6H, half-float RGBA) are shown and exported as PNG: tone-mapped (true) or with
+/// values above 1 clipped to white (false).
+pub static TONEMAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// HDR value -> display byte. Tone-mapped: Reinhard (x / (1 + x)) then gamma 2.2, so bright values roll
+/// off instead of turning white. Clipped: 0..1 as is.
+fn tonemap(v: f32) -> u8 {
+    let x = if v.is_finite() { v.max(0.0) } else { 0.0 };
+    if TONEMAP.load(std::sync::atomic::Ordering::Relaxed) {
+        ((x / (1.0 + x)).powf(1.0 / 2.2) * 255.0 + 0.5) as u8
+    } else {
+        (x.min(1.0) * 255.0 + 0.5) as u8
+    }
+}
+
+impl Fmt {
+    pub fn is_hdr(self) -> bool {
+        matches!(self, Fmt::BC6H | Fmt::BC6HS | Fmt::RGBA16F)
+    }
+}
+
+/// Blue channel of a two-channel normal map: z = sqrt(1 - x² - y²), with x and y stored as 0..255 for -1..1.
+fn normal_z(r: u8, g: u8) -> u8 {
+    let (x, y) = (r as f32 / 127.5 - 1.0, g as f32 / 127.5 - 1.0);
+    let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+    ((z + 1.0) * 127.5 + 0.5).min(255.0) as u8
+}
+
+#[cfg(test)]
+pub fn half_to_f32(h: u16) -> f32 {
+    half(h)
 }
 
 fn half(h: u16) -> f32 {
@@ -150,7 +191,10 @@ fn pixels(lin: &[u8], fmt: Fmt) -> Vec<u8> {
         Fmt::RGBA16 => lin.chunks_exact(8).flat_map(|p| [p[1], p[3], p[5], p[7]]).collect(),
         Fmt::RGBA16F => lin
             .chunks_exact(8)
-            .flat_map(|p| [0, 2, 4, 6].map(|i| to8(half(u16::from_le_bytes([p[i], p[i + 1]])))))
+            .flat_map(|p| {
+                let c = |i: usize| half(u16::from_le_bytes([p[i], p[i + 1]]));
+                [tonemap(c(0)), tonemap(c(2)), tonemap(c(4)), to8(c(6))]
+            })
             .collect(),
         Fmt::R16F => {
             // heights and the like: scale the texture's own range to black..white
