@@ -164,6 +164,22 @@ fn normal_z(r: u8, g: u8) -> u8 {
     ((z + 1.0) * 127.5 + 0.5).min(255.0) as u8
 }
 
+impl Rgba {
+    /// Treat as a normal map whose blue channel isn't its Z: rebuild blue from red and green.
+    pub fn rebuild_normal_z(&mut self) {
+        for p in self.px.chunks_exact_mut(4) {
+            p[2] = normal_z(p[0], p[1]);
+        }
+    }
+}
+
+impl Fmt {
+    /// Colour formats where "rebuild blue as a normal map" makes sense (BC5 always does it already).
+    pub fn may_be_normal_map(self) -> bool {
+        matches!(self, Fmt::BC1 | Fmt::BC2 | Fmt::BC3 | Fmt::BC7 | Fmt::RGBA8 | Fmt::BGRA8)
+    }
+}
+
 #[cfg(test)]
 pub fn half_to_f32(h: u16) -> f32 {
     half(h)

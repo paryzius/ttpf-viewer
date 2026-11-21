@@ -54,7 +54,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
             let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
             let all: Vec<usize> = (0..arc.textures.len()).collect();
             let dds = args.iter().any(|a| a == "--dds");
-            let (written, skipped) = archive::export(&arc, &all, &PathBuf::from(&args[2]), dds, &AtomicUsize::new(0))?;
+            let (written, skipped) = archive::export(&arc, &all, &PathBuf::from(&args[2]), dds, &Default::default(), &AtomicUsize::new(0))?;
             println!("saved {written} textures to {} ({skipped} unreadable)", args[2]);
             Ok(())
         }

@@ -144,7 +144,7 @@ pub fn extract_all(dir: PathBuf, out: PathBuf, dds: bool) -> Task<Result<Extract
             match Archive::open(&p, &Progress::default()) {
                 Ok(a) => {
                     let all: Vec<usize> = (0..a.textures.len()).collect();
-                    let (w, s) = archive::export(&a, &all, &out.join(rel), dds, &AtomicUsize::new(0))?;
+                    let (w, s) = archive::export(&a, &all, &out.join(rel), dds, &Default::default(), &AtomicUsize::new(0))?;
                     r.written += w;
                     r.skipped += s;
                 }

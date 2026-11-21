@@ -219,6 +219,8 @@ pub struct App {
     as_dds: bool,
     /// face / slice shown for a cube map or texture array
     layer: usize,
+    /// textures of the open archive shown as normal maps (blue rebuilt from red and green), by the user's choice
+    normal_maps: HashSet<usize>,
     /// cube maps: show the 3D view instead of a face
     view3d: bool,
     cube3d: Option<Cube3d>,
@@ -341,6 +343,7 @@ impl App {
             tsize: 160.0,
             as_dds: false,
             layer: 0,
+            normal_maps: HashSet::new(),
             view3d: false,
             cube3d: None,
             sort: Sort::Number,
@@ -396,6 +399,7 @@ impl App {
         self.focus = None;
         self.level = None;
         self.layer = 0;
+        self.normal_maps.clear();
         self.message = None;
         self.open_path = Some(path.clone());
         let progress = Arc::new(Progress::default());
@@ -558,9 +562,17 @@ impl App {
         }
         let Some(arc) = self.arc.clone() else { return };
         self.pending.insert(k);
-        let (done, g) = (self.done.clone(), self.hdr_gen);
+        let (done, g, nz) = (self.done.clone(), self.hdr_gen, self.normal_maps.contains(&k.0));
         self.pool.push(Box::new(move || {
-            let r = arc.image_in(k.0, k.1, k.2).map(|img| to_color_image(&img.thumbnail(size))).map_err(|p| p.text().to_string());
+            let r = arc
+                .image_in(k.0, k.1, k.2)
+                .map(|mut img| {
+                    if nz {
+                        img.rebuild_normal_z();
+                    }
+                    to_color_image(&img.thumbnail(size))
+                })
+                .map_err(|p| p.text().to_string());
             done.lock().unwrap().push(Done::Thumb(k, r, g));
         }));
     }
@@ -571,11 +583,16 @@ impl App {
         }
         let Some(arc) = self.arc.clone() else { return };
         self.full_pending = Some(k);
-        let (done, g) = (self.done.clone(), self.hdr_gen);
+        let (done, g, nz) = (self.done.clone(), self.hdr_gen, self.normal_maps.contains(&k.0));
         self.pool.push(Box::new(move || {
             let r = arc
                 .image_in(k.0, k.1, k.2)
-                .map(|img| to_color_image(&if img.w.max(img.h) > 8192 { img.thumbnail(8192) } else { img }))
+                .map(|mut img| {
+                    if nz {
+                        img.rebuild_normal_z();
+                    }
+                    to_color_image(&if img.w.max(img.h) > 8192 { img.thumbnail(8192) } else { img })
+                })
                 .map_err(|p| p.text().to_string());
             done.lock().unwrap().push(Done::Full(k, r, g));
         }));
@@ -862,6 +879,7 @@ impl App {
             return;
         }
         let dds = self.as_dds;
+        let normal_maps = self.normal_maps.clone();
         let Some(dir) = rfd::FileDialog::new().set_title(if dds { "Choose a folder for the DDS files" } else { "Choose a folder for the PNGs" }).pick_folder() else { return };
         let dir = dir.join(&arc.stem);
         let done = Arc::new(AtomicUsize::new(0));
@@ -869,7 +887,7 @@ impl App {
         self.export = Some(Export { total: list.len(), done: done.clone(), result: result.clone(), dir: dir.clone() });
         self.message = None;
         std::thread::spawn(move || {
-            let r = archive::export(&arc, &list, &dir, dds, &done);
+            let r = archive::export(&arc, &list, &dir, dds, &normal_maps, &done);
             *result.lock().unwrap() = Some(r);
         });
     }
@@ -879,7 +897,15 @@ impl App {
         let sfx = arc.textures[t].layer_suffix(layer);
         let name = if level == 0 { format!("{t}{sfx}.png") } else { format!("{t}{sfx}_mip{level}.png") };
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("PNG image", &["png"]).save_file() else { return };
-        self.message = Some(match arc.image_in(t, layer, level).map_err(|p| p.text().to_string()).and_then(|img| archive::save_png(&img, &path)) {
+        let nz = self.normal_maps.contains(&t);
+        self.message = Some(match arc
+            .image_in(t, layer, level)
+            .map(|mut i| {
+                if nz {
+                    i.rebuild_normal_z();
+                }
+                i
+            }).map_err(|p| p.text().to_string()).and_then(|img| archive::save_png(&img, &path)) {
             Ok(()) => (format!("Saved {}", path.display()), path.parent().map(|p| p.to_path_buf())),
             Err(e) => (format!("Couldn't save: {e}"), None),
         });
@@ -888,13 +914,19 @@ impl App {
     /// Copy a face / slice / mip level to the clipboard (decoded in the background).
     fn copy(&mut self, t: usize, layer: usize, level: Option<usize>) {
         let Some(arc) = self.arc.clone() else { return };
-        let done = self.done.clone();
+        let (done, nz) = (self.done.clone(), self.normal_maps.contains(&t));
         self.message = Some(("Copying…".into(), None));
         self.pool.push(Box::new(move || {
             let img = match level {
                 Some(l) => arc.image_in(t, layer, l),
                 None => arc.best_image_in(t, layer),
-            };
+            }
+            .map(|mut i| {
+                if nz {
+                    i.rebuild_normal_z();
+                }
+                i
+            });
             let m = match img.map_err(|p| p.text().to_string()).and_then(|i| copy_image(&i).map(|_| (i.w, i.h))) {
                 Ok((w, h)) => format!("Copied #{t} ({w}x{h}) to the clipboard"),
                 Err(e) => format!("Couldn't copy: {e}"),
@@ -1000,6 +1032,11 @@ impl App {
                     _ if a == "light" => ctx.set_theme(egui::Theme::Light),
                     _ if a == "desc" => self.descending = true,
                     Some(("show", v)) => self.show = Show::from_key(v),
+                    Some(("normal", n)) => {
+                        if let Ok(n) = n.parse() {
+                            self.normal_maps.insert(n);
+                        }
+                    }
                     Some(("fsearch", q)) => {
                         self.fwin = true;
                         self.fquery = q.replace('+', " ");
@@ -1672,6 +1709,30 @@ impl App {
                 ui.end_row();
             }
         });
+        if tex.fmt.is_some_and(|f| f.may_be_normal_map()) {
+            let mut on = self.normal_maps.contains(&t);
+            if ui
+                .checkbox(&mut on, "Normal map: rebuild blue")
+                .on_hover_text("For normal maps that keep only X and Y (red and green): show blue as the Z they imply. Untick to see the stored colours again. Affects the preview, Copy, Save PNG and Extract; DDS keeps the original data.")
+                .changed()
+            {
+                if on {
+                    self.normal_maps.insert(t);
+                } else {
+                    self.normal_maps.remove(&t);
+                }
+                // decode this texture's pictures again; drop what is being decoded with the old setting
+                self.hdr_gen += 1;
+                self.pool.clear();
+                self.pending.clear();
+                self.full_pending = None;
+                self.thumbs.retain(|k, _| k.0 != t);
+                self.failed.retain(|k, _| k.0 != t);
+                if self.full.as_ref().is_some_and(|f| f.0.0 == t) {
+                    self.full = None;
+                }
+            }
+        }
         ui.add_space(4.0);
         if let Some(l) = level {
             ui.horizontal(|ui| {

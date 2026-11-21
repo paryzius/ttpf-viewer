@@ -651,7 +651,8 @@ pub fn save_png(img: &Rgba, path: &Path) -> Result<(), String> {
 /// Export textures to `dir` as PNGs, in parallel. Unavailable ones are skipped.
 /// Returns (written, skipped).
 /// With `dds`, each is saved as .dds holding its original data instead (see [`Archive::dds`]).
-pub fn export(arc: &Archive, list: &[usize], dir: &Path, dds: bool, done: &AtomicUsize) -> Result<(usize, usize), String> {
+/// `normal_maps`: textures to save with their blue channel rebuilt as a normal map's Z (PNG only).
+pub fn export(arc: &Archive, list: &[usize], dir: &Path, dds: bool, normal_maps: &std::collections::HashSet<usize>, done: &AtomicUsize) -> Result<(usize, usize), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Can't create {}: {e}", dir.display()))?;
     let results: Vec<Result<bool, String>> = list
         .par_iter()
@@ -667,7 +668,10 @@ pub fn export(arc: &Archive, list: &[usize], dir: &Path, dds: bool, done: &Atomi
                 let tex = &arc.textures[t];
                 let mut r = Ok(false);
                 for layer in 0..tex.layer_count() {
-                    if let Ok(img) = arc.best_image_in(t, layer) {
+                    if let Ok(mut img) = arc.best_image_in(t, layer) {
+                        if normal_maps.contains(&t) {
+                            img.rebuild_normal_z();
+                        }
                         match save_png(&img, &dir.join(format!("{index}{}.png", tex.layer_suffix(layer)))) {
                             Ok(()) => r = Ok(true),
                             Err(e) => {
