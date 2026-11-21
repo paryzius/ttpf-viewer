@@ -6,6 +6,8 @@ Drop a `.ttpf` onto the window and every texture appears in a gallery, decoded e
 describes it: format, size, GPU tile layout and mip levels. Click one to see it large with all its mip levels,
 save it as PNG, or extract a whole selection at once.
 
+![TTPF Viewer: a gallery of light textures, with a cube map shown on a 3D sphere](docs/screenshot.png)
+
 ## Download
 
 Grab `ttpf-viewer-windows-x64.exe` from the [Releases](../../releases) page. It's a single file, nothing to install.
