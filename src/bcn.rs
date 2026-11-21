@@ -69,7 +69,8 @@ pub struct Rgba {
 }
 
 /// Decode `data` as `fmt` at `w` x `h` pixels (a multiple of the tile size) using the given tile layout.
-pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<Rgba> {
+/// Untile stored data of a `w` x `h` (padded) level into rows of elements (pixels, or 4x4 blocks).
+pub fn linear(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<Vec<u8>> {
     let (b, bytes) = (fmt.block(), fmt.bytes());
     let (we, he) = (w / b, h / b);
     let n = data.len() / bytes;
@@ -77,16 +78,21 @@ pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<R
         return None;
     }
     let pat = tile.pattern(bytes);
-    let lin = if pat.is_empty() {
+    if pat.is_empty() {
         // tile pattern not known: only a texture whose elements are all equal can be decoded exactly
         let first = data.get(..bytes)?;
         if !data.chunks_exact(bytes).all(|p| p == first) {
             return None;
         }
-        first.repeat(n)
-    } else {
-        tile::untile(&data[..n * bytes], bytes, we, he, pat)
-    };
+        return Some(first.repeat(n));
+    }
+    Some(tile::untile(&data[..n * bytes], bytes, we, he, pat))
+}
+
+pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<Rgba> {
+    let lin = linear(data, fmt, w, h, tile)?;
+    let (b, bytes) = (fmt.block(), fmt.bytes());
+    let (we, he) = (w / b, h / b);
     if b == 1 {
         return Some(Rgba { w, h, px: pixels(&lin, fmt) });
     }

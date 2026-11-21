@@ -5,8 +5,6 @@ mod archive;
 mod bcn;
 mod gui;
 mod tile;
-mod video;
-mod video_ui;
 
 use archive::{Archive, Progress, Status};
 use std::path::PathBuf;
@@ -19,9 +17,8 @@ USAGE
   ttpf-viewer                         open the app
   ttpf-viewer FILE.ttpf               open the app with a file
   ttpf-viewer extract FILE.ttpf DIR   save every readable texture as DIR/<number>.png
+        --dds          save .dds files with the original data instead
   ttpf-viewer list FILE.ttpf          print the textures in the file
-  ttpf-viewer videos FILE.rpf DIR     save the Bink 2 videos (.bk2) found in a game archive into DIR
-        --mp4          also convert them to MP4 (needs RAD Video Tools and FFmpeg)
 ";
 
 fn attach_console() {
@@ -45,7 +42,8 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         "extract" if args.len() >= 3 => {
             let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
             let all: Vec<usize> = (0..arc.textures.len()).collect();
-            let (written, skipped) = archive::export(&arc, &all, &PathBuf::from(&args[2]), &AtomicUsize::new(0))?;
+            let dds = args.iter().any(|a| a == "--dds");
+            let (written, skipped) = archive::export(&arc, &all, &PathBuf::from(&args[2]), dds, &AtomicUsize::new(0))?;
             println!("saved {written} textures to {} ({skipped} unreadable)", args[2]);
             Ok(())
         }
@@ -64,25 +62,23 @@ fn run_cli(args: &[String]) -> Result<(), String> {
             println!("\n{} textures: {:?}", arc.textures.len(), counts);
             Ok(())
         }
-        "videos" if args.len() >= 3 => {
-            let src = PathBuf::from(&args[1]);
-            let mut vids = video::scan(&src, &AtomicUsize::new(0), &AtomicUsize::new(0))?;
-            // hidden: --limit N saves only the first N videos
-            if let Some(n) = args.iter().position(|a| a == "--limit").and_then(|i| args.get(i + 1)?.parse().ok()) {
-                vids.truncate(n);
-            }
-            let conv = if args.iter().any(|a| a == "--mp4") {
-                let rad = video::find_rad().ok_or("--mp4 needs RAD Video Tools (radvideo64.exe) installed")?;
-                let ffmpeg = video::find_ffmpeg().ok_or("--mp4 needs FFmpeg (ffmpeg.exe) installed")?;
-                Some(video::Converter { rad, ffmpeg })
-            } else {
-                None
-            };
-            let s = video::save(&src, &vids, &PathBuf::from(&args[2]), conv.as_ref(), &AtomicUsize::new(0))?;
-            println!("saved {} videos to {} ({} converted to MP4, {} failed)", s.saved, args[2], s.converted, s.failed);
-            if let Some(e) = s.error {
-                println!("first conversion error: {e}");
-            }
+        // development aid, not in the help: a checksum of every texture's shown image, to compare builds
+        "checksums" if args.len() >= 2 => {
+            use rayon::prelude::*;
+            let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
+            let lines: Vec<String> = (0..arc.textures.len())
+                .into_par_iter()
+                .map(|i| {
+                    let t = &arc.textures[i];
+                    let h = arc.best_image(i).map(|img| {
+                        let mut h = std::hash::DefaultHasher::new();
+                        std::hash::Hash::hash(&(img.w, img.h, &img.px), &mut h);
+                        format!("{:016x}", std::hash::Hasher::finish(&h))
+                    });
+                    format!("{} {} {}", t.index, status_text(t.status), h.unwrap_or_else(|p| p.text().to_string()))
+                })
+                .collect();
+            println!("{}", lines.join("\n"));
             Ok(())
         }
         // development aid, not in the help: raw stored bytes of a texture's top level
@@ -101,7 +97,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "extract" || a == "list" || a == "videos" || a == "dump-raw" || a == "--help" || a == "-h") {
+    if args.first().is_some_and(|a| a == "extract" || a == "list" || a == "checksums" || a == "dump-raw" || a == "--help" || a == "-h") {
         attach_console();
         if let Err(e) = run_cli(&args) {
             eprintln!("{e}");

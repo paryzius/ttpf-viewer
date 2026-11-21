@@ -8,21 +8,23 @@
 //! 0x0C  u32  bits 0-7: total size, bits 32-39; rest unknown
 //! 0x10  u32  position of the ETPF section / 256
 //! 0x14  u32  unknown
-//! 0x18  u64 per block:  bits  0-23  file offset / 256
-//!                       bits 24-47  position in the unpacked data / 64, low 24 bits
-//!                       bits 48-51  position in the unpacked data / 64, high 4 bits
+//! 0x18  u64 per block:  bits  0-25  where the block ends in the file / 256
+//!                       bits 26-29  how the NEXT block is stored: 0 = as-is, 1-7 = BCPack, 8 = zlib
+//!                       bits 30-51  where the block ends in the unpacked data / 4096
 //!                       bits 52-63  unknown (checksum?)
+//!       The first block starts at the ETPF position in the file and at 0 in the unpacked data; it holds
+//!       the ETPF section itself and is stored as-is.
 //! then, at the ETPF position:
 //!       "ETPF", u32 unknown, u32 number of textures, u32 section size
 //!       16 bytes per texture:
 //!         dword0  bits  0-13 width-1, 14-27 height-1, 28-31 unknown (mip related)
 //!         dword1  bits  0-9  DXGI format << 3 | flags, bits 24-25 tile mode (0 = 64 KB tiles, else 4 KB)
-//!         dword2  bits  0-20 start of the texture in the unpacked data, in 4 KB pages (+0x800)
+//!         dword2  bits  0-20 start of the texture in the unpacked data / 4096
 //!         dword3  unknown
 //!       then a sorted list of 8-byte name hashes
 //! ```
-//! The blocks are consecutive chunks of one unpacked stream; most are zlib, some use a console texture
-//! compression this app can't read. Each texture is a contiguous run of that stream holding its mip levels,
+//! The blocks are consecutive chunks of one unpacked stream; most are zlib, a few are stored as-is, and
+//! some use BCPack, a console texture compression with no public decoder. Each texture is a contiguous run of that stream holding its mip levels,
 //! smallest first: the top level ends where the next texture starts, the next level ends where the top
 //! level starts, and so on. Levels smaller than a tile are stored padded to a whole tile; below the top
 //! level such levels may be packed together, so they are not used.
@@ -115,16 +117,18 @@ impl Texture {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Zlib,
+    Stored,
+    /// BCPack or anything else this app can't unpack
     Other,
     Missing,
 }
 
 struct Block {
     file_off: usize,
+    file_len: usize,
+    /// where it starts in the unpacked stream, and how many bytes it supplies
     start: usize,
-    /// Bytes of the stream it supplies. A zlib block in front of an unreadable one can run past the
-    /// next block's start; then `cover` is its real unpacked length.
-    cover: usize,
+    len: usize,
     kind: Kind,
 }
 
@@ -264,55 +268,34 @@ impl Archive {
             return Err(bad());
         }
         let n = n.min((at - 0x18) / 8);
-        let mut table: Vec<(usize, usize)> = (0..n)
-            .filter_map(|i| {
-                let v = u64::from_le_bytes(d[0x18 + 8 * i..0x20 + 8 * i].try_into().ok()?);
-                let pos = ((v >> 24) & 0xff_ffff) | (((v >> 48) & 0xf) << 24);
-                (v != 0).then(|| (((v & 0xff_ffff) << 8) as usize, (pos << 6) as usize))
-            })
-            .collect();
-        table.sort_by_key(|t| t.1);
+        let mut blocks = Vec::with_capacity(n);
+        let (mut file_pos, mut pos, mut codec) = (at, 0usize, None);
+        for i in 0..n {
+            let v = u64::from_le_bytes(d[0x18 + 8 * i..0x20 + 8 * i].try_into().unwrap());
+            let file_end = ((v & 0x3ff_ffff) << 8) as usize;
+            let end = (((v >> 30) & 0x3f_ffff) << 12) as usize;
+            if file_end > file_pos && end > pos {
+                let (file_off, file_len, len) = (file_pos, file_end - file_pos, end - pos);
+                let head = d.get(file_off..file_off + 2);
+                let zlib = head.is_some_and(|h| h[0] & 0x0f == 8 && (h[0] as u32 * 256 + h[1] as u32) % 31 == 0);
+                let kind = if file_end > d.len() {
+                    Kind::Missing
+                } else {
+                    match codec {
+                        Some(8) | None if zlib => Kind::Zlib,
+                        Some(0) | None if file_len == len => Kind::Stored,
+                        _ => Kind::Other,
+                    }
+                };
+                blocks.push(Block { file_off, file_len, start: pos, len, kind });
+                pos = end;
+            }
+            file_pos = file_pos.max(file_end);
+            codec = Some(((v >> 26) & 0xf) as u8);
+        }
         let count = u32_at(d, at + 8).ok_or_else(bad)? as usize;
         if at + 16 + 16 * count > d.len() {
             return Err(bad());
-        }
-
-        // blocks: what kind each is, and how far the zlib ones in front of an unreadable block really reach
-        let kind_at = |off: usize| {
-            if off >= d.len() {
-                Kind::Missing
-            } else if d[off] == 0x78 {
-                Kind::Zlib
-            } else {
-                Kind::Other
-            }
-        };
-        let mut blocks: Vec<Block> = (0..table.len())
-            .map(|i| {
-                let (file_off, start) = table[i];
-                let end = table.get(i + 1).map(|t| t.1).unwrap_or(total).max(start);
-                Block { file_off, start, cover: end - start, kind: kind_at(file_off) }
-            })
-            .collect();
-        let check: Vec<usize> = (0..blocks.len())
-            .filter(|&i| blocks[i].kind == Kind::Zlib && blocks.get(i + 1).is_none_or(|b| b.kind != Kind::Zlib))
-            .collect();
-        progress.stage("Checking blocks…");
-        progress.total.store(check.len(), Ordering::Relaxed);
-        let found: Vec<(usize, Result<usize, bool>)> = check
-            .par_iter()
-            .map(|&i| {
-                let r = inflate(&d[blocks[i].file_off..], blocks[i].cover).map(|v| v.len());
-                progress.done.fetch_add(1, Ordering::Relaxed);
-                (i, r)
-            })
-            .collect();
-        for (i, r) in found {
-            match r {
-                Ok(len) => blocks[i].cover = blocks[i].cover.max(len),
-                Err(true) => blocks[i].kind = Kind::Missing,
-                Err(false) => blocks[i].kind = Kind::Other,
-            }
         }
 
         // textures
@@ -322,7 +305,7 @@ impl Archive {
                 let o = at + 16 + 16 * i;
                 let (a, b, c) = (u32_at(d, o).unwrap(), u32_at(d, o + 4).unwrap(), u32_at(d, o + 8).unwrap());
                 let tile = if (b >> 24) & 3 == 0 { Tile::T64K } else { Tile::T4K };
-                (i, (a & 0x3fff) as usize + 1, ((a >> 14) & 0x3fff) as usize + 1, (b & 0x3ff) >> 3, tile, (c & 0x1f_ffff) as usize * 4096 + 0x800)
+                (i, (a & 0x3fff) as usize + 1, ((a >> 14) & 0x3fff) as usize + 1, (b & 0x3ff) >> 3, tile, (c & 0x1f_ffff) as usize * 4096)
             })
             .collect();
         let mut by_start: Vec<usize> = (0..raw.len()).collect();
@@ -401,29 +384,16 @@ impl Archive {
         let mut out = Vec::new();
         let mut pos = a;
         while pos < b {
-            let last = self.blocks.partition_point(|bl| bl.start <= pos);
-            if last == 0 {
-                return Err(Problem::Missing);
+            let i = self.blocks.partition_point(|bl| bl.start + bl.len <= pos);
+            let bl = self.blocks.get(i).filter(|bl| bl.start <= pos).ok_or(Problem::Missing)?;
+            match bl.kind {
+                Kind::Zlib | Kind::Stored => {}
+                Kind::Other => return Err(Problem::Compression),
+                Kind::Missing => return Err(Problem::Missing),
             }
-            // a readable block covering pos; an earlier zlib block may run long, so look back a few
-            let ok = (last.saturating_sub(4)..last).rev().find(|&i| {
-                let bl = &self.blocks[i];
-                bl.kind == Kind::Zlib && bl.start + bl.cover > pos
-            });
-            match ok {
-                Some(i) => {
-                    let bl = &self.blocks[i];
-                    let end = b.min(bl.start + bl.cover);
-                    out.push((i, pos - bl.start, end - bl.start));
-                    pos = end;
-                }
-                None => {
-                    return Err(match self.blocks[last - 1].kind {
-                        Kind::Other => Problem::Compression,
-                        _ => Problem::Missing,
-                    });
-                }
-            }
+            let end = b.min(bl.start + bl.len);
+            out.push((i, pos - bl.start, end - bl.start));
+            pos = end;
         }
         Ok(out)
     }
@@ -434,7 +404,10 @@ impl Archive {
             return Ok(b.clone());
         }
         let bl = &self.blocks[i];
-        let data = Arc::new(inflate(&self.map[bl.file_off..], bl.cover).map_err(|_| Problem::Missing)?);
+        let data = Arc::new(match bl.kind {
+            Kind::Stored => self.map[bl.file_off..bl.file_off + bl.file_len].to_vec(),
+            _ => inflate(&self.map[bl.file_off..bl.file_off + bl.file_len], bl.len).map_err(|_| Problem::Missing)?,
+        });
         let mut c = self.cache.lock().unwrap();
         if c.blocks.insert(i, data.clone()).is_none() {
             c.bytes += data.len();
@@ -485,6 +458,60 @@ impl Archive {
     }
 }
 
+impl Archive {
+    /// The texture as a .dds file holding its original stored data (lossless, keeps BCn compression and
+    /// HDR values): the shown level and every readable smaller level below it.
+    pub fn dds(&self, t: usize) -> Result<Vec<u8>, Problem> {
+        let tex = &self.textures[t];
+        let fmt = tex.fmt.ok_or(Problem::Format)?;
+        let first = match tex.status {
+            Status::Unavailable(p) => return Err(p),
+            s => s.shown_level().unwrap_or(0),
+        };
+        let (b, bytes) = (fmt.block(), fmt.bytes());
+        let mut data = Vec::new();
+        let mut mips = 0u32;
+        for l in tex.levels[first..].iter().take_while(|l| l.state.is_ok()) {
+            let Some(lin) = self.read(l.a, l.b).ok().and_then(|d| bcn::linear(&d, fmt, l.pw, l.ph, tex.tile)) else { break };
+            let (we, ew, eh) = (l.pw / b, l.w.div_ceil(b), l.h.div_ceil(b));
+            for y in 0..eh {
+                data.extend_from_slice(&lin[y * we * bytes..(y * we + ew) * bytes]);
+            }
+            mips += 1;
+        }
+        if mips == 0 {
+            return Err(Problem::Missing);
+        }
+        let top = &tex.levels[first];
+        let pitch = if b == 4 { top.w.div_ceil(4) * top.h.div_ceil(4) * bytes } else { top.w * bytes };
+        let mut out = Vec::with_capacity(148 + data.len());
+        out.extend_from_slice(b"DDS ");
+        // size, flags (caps|height|width|pixelformat|mipmapcount|linearsize or pitch), height, width, pitch, depth, mips
+        let flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | if b == 4 { 0x80000 } else { 0x8 };
+        for v in [124, flags, top.h as u32, top.w as u32, pitch as u32, 0, mips] {
+            out.extend_from_slice(&u32::to_le_bytes(v));
+        }
+        out.extend_from_slice(&[0; 44]);
+        // pixel format: "DX10" four-cc, the real format follows in the extra header
+        for v in [32u32, 0x4] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(b"DX10");
+        out.extend_from_slice(&[0; 20]);
+        // caps: texture, plus mipmap|complex when there are several levels
+        let caps = 0x1000 | if mips > 1 { 0x400008 } else { 0 };
+        for v in [caps, 0, 0, 0, 0] {
+            out.extend_from_slice(&u32::to_le_bytes(v));
+        }
+        // DX10 header: format, 2D texture, no flags, array size 1, alpha mode unknown
+        for v in [tex.dxgi, 3, 0, 1, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&data);
+        Ok(out)
+    }
+}
+
 /// File name an exported texture gets.
 pub fn png_name(index: usize) -> String {
     format!("{index}.png")
@@ -496,14 +523,23 @@ pub fn save_png(img: &Rgba, path: &Path) -> Result<(), String> {
 
 /// Export textures to `dir` as PNGs, in parallel. Unavailable ones are skipped.
 /// Returns (written, skipped).
-pub fn export(arc: &Archive, list: &[usize], dir: &Path, done: &AtomicUsize) -> Result<(usize, usize), String> {
+/// With `dds`, each is saved as .dds holding its original data instead (see [`Archive::dds`]).
+pub fn export(arc: &Archive, list: &[usize], dir: &Path, dds: bool, done: &AtomicUsize) -> Result<(usize, usize), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Can't create {}: {e}", dir.display()))?;
     let results: Vec<Result<bool, String>> = list
         .par_iter()
         .map(|&t| {
-            let r = match arc.best_image(t) {
-                Ok(img) => save_png(&img, &dir.join(png_name(arc.textures[t].index))).map(|_| true),
-                Err(_) => Ok(false),
+            let index = arc.textures[t].index;
+            let r = if dds {
+                match arc.dds(t) {
+                    Ok(d) => std::fs::write(dir.join(format!("{index}.dds")), d).map(|_| true).map_err(|e| e.to_string()),
+                    Err(_) => Ok(false),
+                }
+            } else {
+                match arc.best_image(t) {
+                    Ok(img) => save_png(&img, &dir.join(png_name(index))).map(|_| true),
+                    Err(_) => Ok(false),
+                }
             };
             done.fetch_add(1, Ordering::Relaxed);
             r

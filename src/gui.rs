@@ -2,7 +2,6 @@
 
 use crate::archive::{self, Archive, Progress, Status};
 use crate::bcn::Rgba;
-use crate::video_ui::VideosTab;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, FontId, Key, Rect, RichText, Sense, Stroke, StrokeKind, TextureFilter, TextureHandle,
     TextureOptions, TextureWrapMode, Vec2, pos2, vec2,
@@ -86,12 +85,6 @@ struct Export {
     dir: PathBuf,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Textures,
-    Videos,
-}
-
 /// An entry of the folder sidebar.
 struct Entry {
     path: PathBuf,
@@ -131,6 +124,8 @@ pub struct App {
     show_unavailable: bool,
     search: String,
     tsize: f32,
+    /// extract as .dds (original data) instead of .png
+    as_dds: bool,
     cols: usize,
     scroll_y: f32,
     // preview zoom/pan
@@ -138,8 +133,6 @@ pub struct App {
     pan: Vec2,
     refit: bool,
     export: Option<Export>,
-    mode: Mode,
-    videos: VideosTab,
     /// folder shown in the sidebar, and the listing of every folder opened in it
     folder: Option<PathBuf>,
     listing: HashMap<PathBuf, Vec<Entry>>,
@@ -177,14 +170,13 @@ impl App {
             show_unavailable: false,
             search: String::new(),
             tsize: 160.0,
+            as_dds: false,
             cols: 1,
             scroll_y: 0.0,
             zoom: 1.0,
             pan: Vec2::ZERO,
             refit: true,
             export: None,
-            mode: Mode::Textures,
-            videos: VideosTab::new(),
             folder: None,
             listing: HashMap::new(),
             open_path: None,
@@ -235,11 +227,7 @@ impl App {
         if let Some(p) = dropped.into_iter().find(|p| !p.as_os_str().is_empty()) {
             if p.is_dir() {
                 self.set_folder(p);
-            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpf")) {
-                self.mode = Mode::Videos;
-                self.videos.open(p);
             } else {
-                self.mode = Mode::Textures;
                 self.open(p, ctx);
             }
         }
@@ -293,7 +281,7 @@ impl App {
             self.message = Some(match r {
                 Ok((n, skipped)) => {
                     let extra = if skipped > 0 { format!(" ({skipped} unreadable skipped)") } else { String::new() };
-                    (format!("Saved {n} PNG{} to {}{extra}", if n == 1 { "" } else { "s" }, dir.display()), Some(dir))
+                    (format!("Saved {n} texture{} to {}{extra}", if n == 1 { "" } else { "s" }, dir.display()), Some(dir))
                 }
                 Err(err) => (format!("Export failed: {err}"), None),
             });
@@ -381,14 +369,15 @@ impl App {
         if list.is_empty() {
             return;
         }
-        let Some(dir) = rfd::FileDialog::new().set_title("Choose a folder for the PNGs").pick_folder() else { return };
+        let dds = self.as_dds;
+        let Some(dir) = rfd::FileDialog::new().set_title(if dds { "Choose a folder for the DDS files" } else { "Choose a folder for the PNGs" }).pick_folder() else { return };
         let dir = dir.join(&arc.stem);
         let done = Arc::new(AtomicUsize::new(0));
         let result = Arc::new(Mutex::new(None));
         self.export = Some(Export { total: list.len(), done: done.clone(), result: result.clone(), dir: dir.clone() });
         self.message = None;
         std::thread::spawn(move || {
-            let r = archive::export(&arc, &list, &dir, &done);
+            let r = archive::export(&arc, &list, &dir, dds, &done);
             *result.lock().unwrap() = Some(r);
         });
     }
@@ -403,8 +392,16 @@ impl App {
         });
     }
 
+    fn save_dds(&mut self, t: usize) {
+        let Some(arc) = self.arc.clone() else { return };
+        let Some(path) = rfd::FileDialog::new().set_file_name(format!("{t}.dds")).add_filter("DDS texture", &["dds"]).save_file() else { return };
+        self.message = Some(match arc.dds(t).map_err(|p| p.text().to_string()).and_then(|d| std::fs::write(&path, d).map_err(|e| e.to_string())) {
+            Ok(()) => (format!("Saved {}", path.display()), path.parent().map(|p| p.to_path_buf())),
+            Err(e) => (format!("Couldn't save: {e}"), None),
+        });
+    }
+
     fn set_folder(&mut self, dir: PathBuf) {
-        self.mode = Mode::Textures;
         self.listing.clear();
         self.folder = Some(dir);
     }
@@ -470,10 +467,6 @@ impl App {
                     }
                     Some(("level", n)) => self.level = n.parse().ok(),
                     Some(("folder", d)) => self.set_folder(PathBuf::from(d)),
-                    Some(("rpf", f)) => {
-                        self.mode = Mode::Videos;
-                        self.videos.open(PathBuf::from(f));
-                    }
                     Some(("size", n)) => self.tsize = n.parse().unwrap_or(self.tsize),
                     _ if a == "unavailable" => self.show_unavailable = true,
                     _ if a == "light" => ctx.set_theme(egui::Theme::Light),
@@ -481,7 +474,7 @@ impl App {
                 }
             }
         }
-        let busy = !self.pending.is_empty() || self.full_pending.is_some() || self.videos.busy();
+        let busy = !self.pending.is_empty() || self.full_pending.is_some();
         let settled = if busy { 1 } else { settled + 1 };
         self.test.as_mut().unwrap().2 = settled;
         if settled > 20 {
@@ -507,7 +500,7 @@ fn texture_options() -> TextureOptions {
     }
 }
 
-pub fn open_folder(dir: &std::path::Path) {
+fn open_folder(dir: &std::path::Path) {
     #[cfg(windows)]
     let cmd = "explorer";
     #[cfg(target_os = "macos")]
@@ -543,16 +536,6 @@ impl eframe::App for App {
             self.checker = Some(ctx.load_texture("checker", img, opts));
         }
         self.poll(&ctx);
-        egui::Panel::top("modes").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.mode, Mode::Textures, RichText::new("Textures (.ttpf)").strong());
-                ui.selectable_value(&mut self.mode, Mode::Videos, RichText::new("Videos (.rpf)").strong());
-            });
-        });
-        if self.mode == Mode::Videos {
-            egui::CentralPanel::default_margins().show(ui, |ui| self.videos.ui(ui));
-            return;
-        }
         self.keys(&ctx);
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
@@ -646,6 +629,13 @@ impl App {
             ui.add(egui::Slider::new(&mut self.tsize, 64.0..=384.0).show_value(false));
             ui.separator();
             let busy = self.export.is_some();
+            egui::ComboBox::from_id_salt("as")
+                .width(60.0)
+                .selected_text(if self.as_dds { "DDS" } else { "PNG" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.as_dds, false, "PNG");
+                    ui.selectable_value(&mut self.as_dds, true, "DDS").on_hover_text("The original data: lossless, keeps the compression, HDR values and mip levels");
+                });
             let n_sel = self.selected.len();
             if ui.add_enabled(n_sel > 0 && !busy, egui::Button::new(format!("Extract selected ({n_sel})"))).clicked() {
                 let l: Vec<usize> = self.selected.iter().copied().collect();
@@ -934,9 +924,14 @@ impl App {
         });
         ui.add_space(4.0);
         if let Some(l) = level {
-            if ui.button("Save PNG…").clicked() {
-                self.save_one(t, l);
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Save PNG…").clicked() {
+                    self.save_one(t, l);
+                }
+                if ui.button("Save DDS…").on_hover_text("The original data: lossless, keeps the compression, HDR values and mip levels").clicked() {
+                    self.save_dds(t);
+                }
+            });
         }
     }
 }
