@@ -67,7 +67,8 @@ impl Pool {
 }
 
 /// (texture, mip level)
-type Key2 = (usize, usize);
+/// (texture, face / slice, mip level)
+type Key2 = (usize, usize, usize);
 
 /// Gallery order.
 #[derive(Clone, Copy, PartialEq)]
@@ -135,6 +136,8 @@ pub struct App {
     tsize: f32,
     /// extract as .dds (original data) instead of .png
     as_dds: bool,
+    /// face / slice shown for a cube map or texture array
+    layer: usize,
     sort: Sort,
     descending: bool,
     /// bumped when the HDR display setting changes, so images decoded with the old one are dropped
@@ -184,6 +187,7 @@ impl App {
             search: String::new(),
             tsize: 160.0,
             as_dds: false,
+            layer: 0,
             sort: Sort::Number,
             descending: false,
             hdr_gen: 0,
@@ -221,6 +225,7 @@ impl App {
         self.selected.clear();
         self.focus = None;
         self.level = None;
+        self.layer = 0;
         self.message = None;
         self.open_path = Some(path.clone());
         let progress = Arc::new(Progress::default());
@@ -262,7 +267,7 @@ impl App {
                     self.pending.remove(&k);
                     match r {
                         Ok(img) => {
-                            let t = ctx.load_texture(format!("t{}_{}", k.0, k.1), img, texture_options());
+                            let t = ctx.load_texture(format!("t{}_{}_{}", k.0, k.1, k.2), img, texture_options());
                             self.thumbs.insert(k, (t, self.frame));
                         }
                         Err(e) => {
@@ -343,7 +348,7 @@ impl App {
         self.pending.insert(k);
         let (done, g) = (self.done.clone(), self.hdr_gen);
         self.pool.push(Box::new(move || {
-            let r = arc.image(k.0, k.1).map(|img| to_color_image(&img.thumbnail(size))).map_err(|p| p.text().to_string());
+            let r = arc.image_in(k.0, k.1, k.2).map(|img| to_color_image(&img.thumbnail(size))).map_err(|p| p.text().to_string());
             done.lock().unwrap().push(Done::Thumb(k, r, g));
         }));
     }
@@ -357,7 +362,7 @@ impl App {
         let (done, g) = (self.done.clone(), self.hdr_gen);
         self.pool.push(Box::new(move || {
             let r = arc
-                .image(k.0, k.1)
+                .image_in(k.0, k.1, k.2)
                 .map(|img| to_color_image(&if img.w.max(img.h) > 8192 { img.thumbnail(8192) } else { img }))
                 .map_err(|p| p.text().to_string());
             done.lock().unwrap().push(Done::Full(k, r, g));
@@ -386,6 +391,7 @@ impl App {
         if self.focus != Some(t) {
             self.focus = Some(t);
             self.level = None;
+            self.layer = 0;
             self.refit = true;
         }
     }
@@ -408,11 +414,12 @@ impl App {
         });
     }
 
-    fn save_one(&mut self, t: usize, level: usize) {
+    fn save_one(&mut self, t: usize, layer: usize, level: usize) {
         let Some(arc) = self.arc.clone() else { return };
-        let name = if level == 0 { archive::png_name(t) } else { format!("{t}_mip{level}.png") };
+        let sfx = arc.textures[t].layer_suffix(layer);
+        let name = if level == 0 { format!("{t}{sfx}.png") } else { format!("{t}{sfx}_mip{level}.png") };
         let Some(path) = rfd::FileDialog::new().set_file_name(&name).add_filter("PNG image", &["png"]).save_file() else { return };
-        self.message = Some(match arc.image(t, level).map_err(|p| p.text().to_string()).and_then(|img| archive::save_png(&img, &path)) {
+        self.message = Some(match arc.image_in(t, layer, level).map_err(|p| p.text().to_string()).and_then(|img| archive::save_png(&img, &path)) {
             Ok(()) => (format!("Saved {}", path.display()), path.parent().map(|p| p.to_path_buf())),
             Err(e) => (format!("Couldn't save: {e}"), None),
         });
@@ -492,6 +499,7 @@ impl App {
                         }
                     }
                     Some(("level", n)) => self.level = n.parse().ok(),
+                    Some(("layer", n)) => self.layer = n.parse().unwrap_or(0),
                     Some(("folder", d)) => self.set_folder(PathBuf::from(d)),
                     Some(("size", n)) => self.tsize = n.parse().unwrap_or(self.tsize),
                     _ if a == "unavailable" => self.show_unavailable = true,
@@ -822,7 +830,7 @@ impl App {
                 p.text(img_area.center(), Align2::CENTER_CENTER, prob.text(), FontId::proportional(12.0), vis.weak_text_color());
             }
             s => {
-                let k = (t, s.shown_level().unwrap_or(0));
+                let k = (t, 0, s.shown_level().unwrap_or(0));
                 if let Some(e) = self.failed.get(&k) {
                     p.text(img_area.center(), Align2::CENTER_CENTER, e, FontId::proportional(12.0), vis.error_fg_color);
                 } else if let Some((th, f)) = self.thumbs.get_mut(&k) {
@@ -884,7 +892,10 @@ impl App {
         let (Some(arc), Some(t)) = (self.arc.clone(), self.focus) else { return };
         let tex = &arc.textures[t];
         let vis = ui.visuals().clone();
-        let level = self.level.or(tex.status.shown_level());
+        let layer = self.layer.min(tex.layer_count() - 1);
+        let levels = tex.layer_levels(layer);
+        // a face / slice can be readable only at a smaller size than the first one: then show its largest
+        let level = self.level.or(if layer == 0 { tex.status.shown_level() } else { levels.iter().position(|l| l.state.is_ok()) });
         ui.horizontal(|ui| {
             ui.heading(format!("#{t}"));
             ui.label(format!("{}x{}", tex.w, tex.h));
@@ -904,13 +915,13 @@ impl App {
             }
         }
         // image with zoom / pan
-        let below = 110.0 + 120.0;
+        let below = 110.0 + 120.0 + if tex.layer_count() > 1 { MIP_THUMB as f32 + 42.0 } else { 0.0 };
         let area_size = vec2(ui.available_width(), (ui.available_height() - below).max(200.0));
         let (area, resp) = ui.allocate_exact_size(area_size, Sense::click_and_drag());
         let p = ui.painter_at(area);
         p.rect_filled(area, 4.0, vis.extreme_bg_color);
         if let Some(l) = level {
-            let k = (t, l);
+            let k = (t, layer, l);
             self.request_full(k);
             let shown = self.full.as_ref().filter(|f| f.0 == k).map(|f| f.1.clone());
             if let Some(th) = shown {
@@ -955,18 +966,61 @@ impl App {
             }
             ui.label(RichText::new("wheel: zoom   drag: pan   double-click: fit").color(vis.weak_text_color()));
         });
-        // mip levels
-        if !tex.levels.is_empty() {
-            ui.label(RichText::new("Mip levels").strong());
-            egui::ScrollArea::horizontal().id_salt("mips").max_height(MIP_THUMB as f32 + 24.0).show(ui, |ui| {
+        // faces / slices
+        if tex.layer_count() > 1 {
+            let shown = tex.status.shown_level();
+            ui.label(RichText::new(if tex.cube { "Faces" } else { "Slices" }).strong());
+            egui::ScrollArea::horizontal().id_salt("layers").max_height(MIP_THUMB as f32 + 24.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (li, lv) in tex.levels.iter().enumerate() {
+                    for li in 0..tex.layer_count() {
                         let s = MIP_THUMB as f32;
                         let (rect, r) = ui.allocate_exact_size(vec2(s, s + 18.0), Sense::click());
                         let p = ui.painter_at(rect);
                         let box_ = Rect::from_min_size(rect.min, vec2(s, s));
                         p.rect_filled(box_, 3.0, vis.extreme_bg_color);
-                        let k = (t, li);
+                        let best = if shown.is_some() { tex.layer_levels(li).iter().position(|l| l.state.is_ok()) } else { None };
+                        if best.is_none() {
+                            p.text(box_.center(), Align2::CENTER_CENTER, "unreadable", FontId::proportional(11.0), vis.weak_text_color());
+                        }
+                        if let Some(sl) = best {
+                            let k = (t, li, sl);
+                            if let Some((th, f)) = self.thumbs.get_mut(&k) {
+                                *f = self.frame;
+                                let rr = fit_rect(box_.shrink(3.0), th.size_vec2());
+                                let id = th.id();
+                                self.checker(&p, rr);
+                                p.image(id, rr, FULL_UV, Color32::WHITE);
+                            } else if self.failed.contains_key(&k) {
+                                p.text(box_.center(), Align2::CENTER_CENTER, "error", FontId::proportional(11.0), vis.error_fg_color);
+                            } else {
+                                self.request_thumb(k, MIP_THUMB);
+                            }
+                        }
+                        let st = if li == layer { Stroke::new(2.0, vis.strong_text_color()) } else { vis.widgets.noninteractive.bg_stroke };
+                        p.rect_stroke(box_, 3.0, st, StrokeKind::Inside);
+                        let name = tex.layer_name(li);
+                        p.text(pos2(rect.min.x + 2.0, box_.max.y + 2.0), Align2::LEFT_TOP, name, FontId::proportional(11.0), vis.text_color());
+                        if r.clicked() && li != layer {
+                            self.layer = li;
+                            self.level = None;
+                            self.refit = true;
+                        }
+                    }
+                });
+            });
+        }
+        // mip levels
+        if !levels.is_empty() {
+            ui.label(RichText::new("Mip levels").strong());
+            egui::ScrollArea::horizontal().id_salt("mips").max_height(MIP_THUMB as f32 + 24.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (li, lv) in levels.iter().enumerate() {
+                        let s = MIP_THUMB as f32;
+                        let (rect, r) = ui.allocate_exact_size(vec2(s, s + 18.0), Sense::click());
+                        let p = ui.painter_at(rect);
+                        let box_ = Rect::from_min_size(rect.min, vec2(s, s));
+                        p.rect_filled(box_, 3.0, vis.extreme_bg_color);
+                        let k = (t, layer, li);
                         if lv.state.is_err() {
                             p.text(box_.center(), Align2::CENTER_CENTER, "unreadable", FontId::proportional(11.0), vis.weak_text_color());
                         } else if let Some((th, f)) = self.thumbs.get_mut(&k) {
@@ -997,7 +1051,8 @@ impl App {
             ui.end_row();
             if let Some(l) = level {
                 ui.label("Showing");
-                ui.label(format!("mip {l}: {}x{}", tex.levels[l].w, tex.levels[l].h));
+                let what = if tex.layer_count() > 1 { format!("{}, ", tex.layer_name(layer)) } else { String::new() };
+                ui.label(format!("{what}mip {l}: {}x{}", levels[l].w, levels[l].h));
                 ui.end_row();
             }
         });
@@ -1005,7 +1060,7 @@ impl App {
         if let Some(l) = level {
             ui.horizontal(|ui| {
                 if ui.button("Save PNG…").clicked() {
-                    self.save_one(t, l);
+                    self.save_one(t, self.layer, l);
                 }
                 if ui.button("Save DDS…").on_hover_text("The original data: lossless, keeps the compression, HDR values and mip levels").clicked() {
                     self.save_dds(t);

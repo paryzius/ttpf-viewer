@@ -245,13 +245,14 @@ impl Rgba {
     }
 
     /// The top-left `w` x `h` part (removes tile padding).
-    pub fn crop(&self, w: usize, h: usize) -> Rgba {
-        if (self.w, self.h) == (w, h) {
+    /// The `w` x `h` part starting at (`x`, `y`).
+    pub fn crop_at(&self, x: usize, y: usize, w: usize, h: usize) -> Rgba {
+        if (x, y, self.w, self.h) == (0, 0, w, h) {
             return self.clone();
         }
         let mut px = Vec::with_capacity(w * h * 4);
-        for y in 0..h {
-            px.extend_from_slice(&self.px[y * self.w * 4..y * self.w * 4 + w * 4]);
+        for row in y..y + h {
+            px.extend_from_slice(&self.px[(row * self.w + x) * 4..(row * self.w + x + w) * 4]);
         }
         Rgba { w, h, px }
     }

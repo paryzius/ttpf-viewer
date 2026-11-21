@@ -5,6 +5,7 @@ mod archive;
 mod bc6h;
 mod bcn;
 mod gui;
+mod layout;
 mod tile;
 
 use archive::{Archive, Progress, Status};
@@ -92,8 +93,9 @@ fn run_cli(args: &[String]) -> Result<(), String> {
             let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
             let lines: Vec<String> = (0..arc.textures.len())
                 .into_par_iter()
-                .filter_map(|i| {
-                    let (Ok(a), Ok(b)) = (arc.image(i, 0), arc.image(i, 1)) else { return None };
+                .flat_map(|i| (0..arc.textures[i].layer_count()).map(move |l| (i, l)).collect::<Vec<_>>())
+                .filter_map(|(i, layer)| {
+                    let (Ok(a), Ok(b)) = (arc.image_in(i, layer, 0), arc.image_in(i, layer, 1)) else { return None };
                     if a.w < 8 || a.h < 8 || b.w != a.w / 2 || b.h != a.h / 2 {
                         return None;
                     }
@@ -110,7 +112,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
                             }
                         }
                     }
-                    Some(format!("{i} {:.2} {:.2}", err / n, spread / n))
+                    Some(format!("{i} {:.2} {:.2} {layer}", err / n, spread / n))
                 })
                 .collect();
             println!("{}", lines.join("\n"));
