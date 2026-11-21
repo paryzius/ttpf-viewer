@@ -1,12 +1,13 @@
 [package]
 name = "ttpf-viewer"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Browse and extract textures from .ttpf texture archives"
 license = "MIT"
 
 [dependencies]
+arboard = "3"
 eframe = "0.37.0"
 flate2 = "1.1.11"
 image = { version = "0.25.10", default-features = false, features = ["png"] }

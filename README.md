@@ -16,16 +16,18 @@ Grab `ttpf-viewer-windows-x64.exe` from the [Releases](../../releases) page. It'
 | | |
 |---|---|
 | Open a file | drag it onto the window, click **Open .ttpf…**, or `ttpf-viewer FILE.ttpf` |
-| Browse a folder | **Open folder…** (or drop a folder): its `.ttpf` files appear in a sidebar; click one to open it |
+| Browse a folder | **Open folder…** (or drop a folder): its `.ttpf` files appear in a sidebar; click one to open it. **Search all…** finds textures in every file of the folder (click a result to jump to it); **Extract all…** saves every file's textures, one folder per file |
 | Select | click; **Ctrl**+click to add; **Shift**+click for a range; **Ctrl+A** all; arrow keys to move |
 | Preview | mouse wheel zooms, drag pans, double-click fits; click a mip level below the image to view it |
 | Extract | **Extract selected** or **Extract all shown**: `<number>.png` files go into a folder named after the archive. Pick **DDS** next to the buttons (or **Save DDS…** for one texture) to get the original data instead: lossless, with its BCn compression, HDR values and mip levels |
-| Find | search by texture number, size (`512x256`) or format (`BC7`); sort by number, size or format, ascending or descending |
-| Cube maps, arrays | pick a face or slice in the strip under the preview; for cube maps, **3D** shows it from inside (**Look around**, like a sky) or wrapped on a **Sphere**: drag to turn, wheel to zoom, **Up: Z/Y** picks the world's up axis (Z for RAGE games). Extracting saves one PNG per face (`<number>_px.png`, `_nx`, `_py`, `_ny`, `_pz`, `_nz`) or slice (`<number>_0.png`, …); DDS keeps them all in one file |
+| Find | search by texture number, size (`512x256`) or format (`BC7`); **Show** only cube maps, texture arrays, HDR, smaller-size-only or unavailable textures; sort by number, size or format, ascending or descending |
+| Copy | right-click a texture (or **Copy** under the preview) to put it on the clipboard; the right-click menu also saves PNG, DDS or a panorama |
+| Cube maps, arrays | pick a face or slice in the strip under the preview; for cube maps, **3D** shows it from inside (**Look around**, like a sky) or wrapped on a **Sphere**: drag to turn, wheel to zoom, **Up: Z/Y** picks the world's up axis (Z for RAGE games). **Save panorama…** saves the whole cube map as one 360° picture (2:1), the format sky viewers and 3D programs use. Extracting saves one PNG per face (`<number>_px.png`, `_nx`, `_py`, `_ny`, `_pz`, `_nz`) or slice (`<number>_0.png`, …); DDS keeps them all in one file |
 | HDR | BC6H and half-float textures are tone-mapped so bright parts keep their detail; switch to **clipped** in the toolbar to see values as stored (`--clip` on the command line) |
 
 Archives open instantly, even multi-gigabyte ones: only the header is read up front, and texture data is
-unpacked when it is shown or exported.
+unpacked when it is shown or exported. Settings (sort, filter, thumbnail size, HDR, PNG/DDS, 3D up axis, the open folder)
+are remembered between runs.
 
 ### What it can't show
 
@@ -44,8 +46,11 @@ R16_FLOAT (shown as grey scaled to its own range, e.g. heightmaps), R8G8B8A8, B8
 
 ```
 ttpf-viewer extract FILE.ttpf OUTDIR   save every readable texture as OUTDIR/<number>.png (--dds: as .dds)
+ttpf-viewer extract-folder DIR OUTDIR  the same for every .ttpf under DIR, one folder per file (--dds)
+ttpf-viewer panorama FILE.ttpf N OUT.png   save cube map #N as a 360° panorama (--y-up if Y is up)
 ttpf-viewer list FILE.ttpf             print the textures in the file
 ```
+`--clip` shows HDR textures clipped instead of tone-mapped.
 
 ## The format
 
@@ -96,7 +101,7 @@ apply the actions, save its own rendered window to `out.png` and quit.
 - [egui / eframe](https://github.com/emilk/egui) for the interface
 - [texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder) for BCn decoding; `src/bc6h.rs` is its BC6H decoder
   adapted to keep HDR values (MIT, notice in the file)
-- [rfd](https://github.com/PolyMeilex/rfd), [image](https://github.com/image-rs/image), [flate2](https://github.com/rust-lang/flate2-rs), [rayon](https://github.com/rayon-rs/rayon), [memmap2](https://github.com/RazrFalcon/memmap2-rs)
+- [arboard](https://github.com/1Password/arboard) for the clipboard, [rfd](https://github.com/PolyMeilex/rfd), [image](https://github.com/image-rs/image), [flate2](https://github.com/rust-lang/flate2-rs), [rayon](https://github.com/rayon-rs/rayon), [memmap2](https://github.com/RazrFalcon/memmap2-rs)
 
 - [Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars) and [PercyStar](https://github.com/rpatty-dev/PercyStar) (by rpatty-dev),
   whose research showed how the block table encodes block ends and storage types, and

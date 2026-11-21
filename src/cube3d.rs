@@ -52,6 +52,30 @@ fn sample(faces: &[Rgba; 6], x: f32, y: f32, z: f32) -> [u8; 4] {
     out
 }
 
+/// Colour in a direction given Y-up (x right, y up, z forward), for a cube map whose world is Z-up or Y-up.
+fn look(faces: &[Rgba; 6], d: [f32; 3], z_up: bool) -> [u8; 4] {
+    // for a Z-up cube map turn the viewer's up (+Y) to +Z
+    if z_up { sample(faces, d[0], -d[2], d[1]) } else { sample(faces, d[0], d[1], d[2]) }
+}
+
+/// The whole cube map as a 360-degree panorama (equirectangular, 2:1), as used for skies in 3D programs and
+/// panorama viewers. The middle of the picture is straight ahead in the 3D view's starting direction.
+pub fn panorama(faces: &[Rgba; 6], z_up: bool) -> Rgba {
+    let w = (faces[0].w * 4).clamp(64, 8192);
+    let h = w / 2;
+    let mut px = vec![0u8; w * h * 4];
+    px.par_chunks_mut(w * 4).enumerate().for_each(|(j, row)| {
+        let lat = (0.5 - (j as f32 + 0.5) / h as f32) * std::f32::consts::PI;
+        for i in 0..w {
+            let lon = ((i as f32 + 0.5) / w as f32 - 0.5) * std::f32::consts::TAU;
+            let d = [lat.cos() * lon.sin(), lat.sin(), lat.cos() * lon.cos()];
+            let c = look(faces, d, z_up);
+            row[i * 4..i * 4 + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+    });
+    Rgba { w, h, px }
+}
+
 /// Render `w` x `h` RGBA pixels. Outside the sphere is left transparent.
 pub fn render(faces: &[Rgba; 6], view: View, w: usize, h: usize) -> Vec<u8> {
     let (sy, cy, sp, cp) = (view.yaw.sin(), view.yaw.cos(), view.pitch.sin(), view.pitch.cos());
@@ -84,8 +108,7 @@ pub fn render(faces: &[Rgba; 6], view: View, w: usize, h: usize) -> Vec<u8> {
                 right[1] * a + up[1] * b + fwd[1] * c,
                 right[2] * a + up[2] * b + fwd[2] * c,
             ];
-            // the camera works Y-up; for a Z-up cube map turn its up (+Y) to +Z
-            let col = if view.z_up { sample(faces, d[0], -d[2], d[1]) } else { sample(faces, d[0], d[1], d[2]) };
+            let col = look(faces, d, view.z_up);
             row[i * 4..i * 4 + 4].copy_from_slice(&[col[0], col[1], col[2], 255]);
         }
     });

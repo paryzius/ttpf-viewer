@@ -1,6 +1,6 @@
 //! The app window: texture gallery, large preview with mip levels, and PNG export.
 
-use crate::archive::{self, Archive, Progress, Status};
+use crate::archive::{Texture, self, Archive, Progress, Status};
 use crate::bcn::Rgba;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, FontId, Key, Rect, RichText, Sense, Stroke, StrokeKind, TextureFilter, TextureHandle,
@@ -78,11 +78,79 @@ enum Sort {
     Format,
 }
 
+/// Which textures the gallery shows.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Show {
+    All,
+    Cube,
+    Array,
+    Hdr,
+    Reduced,
+    Unavailable,
+}
+
+impl Show {
+    pub const ALL: [Show; 6] = [Show::All, Show::Cube, Show::Array, Show::Hdr, Show::Reduced, Show::Unavailable];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Show::All => "All textures",
+            Show::Cube => "Cube maps",
+            Show::Array => "Texture arrays",
+            Show::Hdr => "HDR (BC6H, half-float)",
+            Show::Reduced => "Only at a smaller size",
+            Show::Unavailable => "Unavailable",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Show::All => "all",
+            Show::Cube => "cube",
+            Show::Array => "array",
+            Show::Hdr => "hdr",
+            Show::Reduced => "reduced",
+            Show::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Show {
+        Show::ALL.into_iter().find(|s| s.key() == k).unwrap_or(Show::All)
+    }
+
+    pub fn wants(self, t: &Texture) -> bool {
+        match self {
+            Show::All => true,
+            Show::Cube => t.cube,
+            Show::Array => !t.cube && t.layer_count() > 1,
+            Show::Hdr => t.fmt.is_some_and(|f| f.is_hdr()),
+            Show::Reduced => matches!(t.status, Status::Reduced(_)),
+            Show::Unavailable => matches!(t.status, Status::Unavailable(_)),
+        }
+    }
+}
+
+/// Does texture `t` pass the search text `q` (lower case, no '#': a number, "512x256", a format name) and the filter?
+/// Unavailable textures only pass when asked for.
+pub fn matches(t: &Texture, q: &str, show: Show, unavailable: bool) -> bool {
+    show.wants(t)
+        && (unavailable || show == Show::Unavailable || !matches!(t.status, Status::Unavailable(_)))
+        && (q.is_empty() || t.index.to_string() == q || format!("{}x{} {}", t.w, t.h, t.format_name()).to_lowercase().contains(q))
+}
+
 /// Decoded images; the last field is the HDR setting generation they were made with.
 enum Done {
     Thumb(Key2, Result<ColorImage, String>, u32),
     Full(Key2, Result<ColorImage, String>, u32),
     Cube(usize, Result<Arc<[Rgba; 6]>, String>, u32),
+    /// a status-bar message from background work, and a folder to offer opening
+    Message(String, Option<PathBuf>),
+}
+
+/// Put an image on the clipboard.
+pub fn copy_image(img: &Rgba) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_image(arboard::ImageData { width: img.w, height: img.h, bytes: std::borrow::Cow::Borrowed(&img.px) }).map_err(|e| e.to_string())
 }
 
 /// The 3D view of a cube map: its faces, the camera, and the last rendered picture.
@@ -142,6 +210,7 @@ pub struct App {
     anchor: Option<usize>,
     scroll_to_focus: bool,
     show_unavailable: bool,
+    show: Show,
     search: String,
     tsize: f32,
     /// extract as .dds (original data) instead of .png
@@ -153,6 +222,10 @@ pub struct App {
     cube3d: Option<Cube3d>,
     sort: Sort,
     descending: bool,
+    /// 3D view: Z is up (kept for new cube maps and between runs)
+    z_up: bool,
+    /// settings as last saved
+    saved: crate::settings::Settings,
     /// bumped when the HDR display setting changes, so images decoded with the old one are dropped
     hdr_gen: u32,
     cols: usize,
@@ -166,6 +239,17 @@ pub struct App {
     folder: Option<PathBuf>,
     listing: HashMap<PathBuf, Vec<Entry>>,
     open_path: Option<PathBuf>,
+    /// search across the sidebar folder: window open, query, filter, running search, results
+    fwin: bool,
+    fquery: String,
+    fshow: Show,
+    funavailable: bool,
+    fsearch: Option<crate::folder::Task<crate::folder::Found>>,
+    found: Option<crate::folder::Found>,
+    /// extracting the whole sidebar folder, and where to
+    fexport: Option<(crate::folder::Task<Result<crate::folder::Extracted, String>>, PathBuf)>,
+    /// texture to select once the archive being opened has loaded
+    pending_focus: Option<usize>,
     message: Option<(String, Option<PathBuf>)>,
     /// Developer test hook (env TTPF_VIEWER_TEST="out.png;select=12,level=1,unavailable,light,size=200"): once
     /// everything has loaded, save the app's own rendered frame to out.png and quit.
@@ -174,6 +258,53 @@ pub struct App {
 
 impl App {
     fn new(file: Option<PathBuf>) -> App {
+        let mut app = App::blank(file);
+        // the test hook always starts from the defaults
+        if app.test.is_none() {
+            let s = crate::settings::Settings::load();
+            app.sort = match s.sort.as_str() {
+                "size" => Sort::Size,
+                "format" => Sort::Format,
+                _ => Sort::Number,
+            };
+            app.descending = s.descending;
+            app.tsize = s.thumb_size;
+            app.show = Show::from_key(&s.show);
+            app.show_unavailable = s.show_unavailable;
+            crate::bcn::TONEMAP.store(s.tonemap, Ordering::Relaxed);
+            app.as_dds = s.as_dds;
+            app.z_up = s.z_up;
+            app.folder = s.folder.clone();
+            app.saved = s;
+        }
+        app
+    }
+
+    /// Settings as they are now.
+    fn settings(&self) -> crate::settings::Settings {
+        crate::settings::Settings {
+            sort: match self.sort {
+                Sort::Number => "number",
+                Sort::Size => "size",
+                Sort::Format => "format",
+            }
+            .into(),
+            descending: self.descending,
+            thumb_size: self.tsize,
+            show: self.show.key().into(),
+            show_unavailable: self.show_unavailable,
+            tonemap: crate::bcn::TONEMAP.load(Ordering::Relaxed),
+            as_dds: self.as_dds,
+            z_up: self.z_up,
+            folder: self.folder.clone(),
+        }
+    }
+
+    fn new_cube3d(&self, t: usize) -> Cube3d {
+        Cube3d { t, faces: None, error: None, view: crate::cube3d::View { z_up: self.z_up, ..Default::default() }, shown: None }
+    }
+
+    fn blank(file: Option<PathBuf>) -> App {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         App {
             pool: Pool::new(threads),
@@ -197,6 +328,7 @@ impl App {
             anchor: None,
             scroll_to_focus: false,
             show_unavailable: false,
+            show: Show::All,
             search: String::new(),
             tsize: 160.0,
             as_dds: false,
@@ -205,6 +337,8 @@ impl App {
             cube3d: None,
             sort: Sort::Number,
             descending: false,
+            z_up: true,
+            saved: Default::default(),
             hdr_gen: 0,
             cols: 1,
             scroll_y: 0.0,
@@ -215,6 +349,14 @@ impl App {
             folder: None,
             listing: HashMap::new(),
             open_path: None,
+            fwin: false,
+            fquery: String::new(),
+            fshow: Show::All,
+            funavailable: false,
+            fsearch: None,
+            found: None,
+            fexport: None,
+            pending_focus: None,
             message: None,
             test: std::env::var("TTPF_VIEWER_TEST").ok().map(|v| {
                 let (out, acts) = v.split_once(';').unwrap_or((&v, ""));
@@ -270,7 +412,12 @@ impl App {
         let loaded = self.loading.as_ref().and_then(|l| l.result.lock().unwrap().take());
         if let Some(r) = loaded {
             match r {
-                Ok(a) => self.arc = Some(a),
+                Ok(a) => {
+                    self.arc = Some(a);
+                    if let Some(i) = self.pending_focus.take() {
+                        self.focus_texture(i);
+                    }
+                }
                 Err(e) => self.error = Some(e),
             }
             self.loading = None;
@@ -278,6 +425,7 @@ impl App {
         for d in std::mem::take(&mut *self.done.lock().unwrap()) {
             match d {
                 Done::Thumb(_, _, g) | Done::Full(_, _, g) | Done::Cube(_, _, g) if g != self.hdr_gen => {}
+                Done::Message(m, dir) => self.message = Some((m, dir)),
                 Done::Cube(t, r, _) => {
                     if let Some(c) = self.cube3d.as_mut().filter(|c| c.t == t) {
                         match r {
@@ -335,7 +483,28 @@ impl App {
         }
         self.refresh_rows();
         self.test_hook(ctx);
-        if self.loading.is_some() || self.export.is_some() || !self.pending.is_empty() || self.full_pending.is_some() {
+        if let Some(f) = self.fsearch.as_ref().and_then(|t| t.take()) {
+            self.found = Some(f);
+            self.fsearch = None;
+        }
+        let fin = self.fexport.as_ref().and_then(|(t, d)| t.take().map(|r| (r, d.clone())));
+        if let Some((r, dir)) = fin {
+            self.fexport = None;
+            self.message = Some(match r {
+                Ok(e) => {
+                    let mut m = format!("Saved {} textures from {} files to {}", e.written, e.files - e.failed, dir.display());
+                    if e.skipped > 0 {
+                        m += &format!(" ({} unreadable)", e.skipped);
+                    }
+                    if e.failed > 0 {
+                        m += &format!(", {} files couldn't be opened", e.failed);
+                    }
+                    (m, Some(dir))
+                }
+                Err(e) => (format!("Extracting failed: {e}"), None),
+            });
+        }
+        if self.loading.is_some() || self.export.is_some() || self.fsearch.is_some() || self.fexport.is_some() || !self.pending.is_empty() || self.full_pending.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
     }
@@ -344,15 +513,7 @@ impl App {
         let Some(arc) = &self.arc else { return };
         let q = self.search.trim().trim_start_matches('#').to_lowercase();
         self.unavailable = arc.textures.iter().filter(|t| matches!(t.status, Status::Unavailable(_))).count();
-        self.rows = arc
-            .textures
-            .iter()
-            .filter(|t| self.show_unavailable || !matches!(t.status, Status::Unavailable(_)))
-            .filter(|t| {
-                q.is_empty() || t.index.to_string() == q || format!("{}x{} {}", t.w, t.h, t.format_name()).to_lowercase().contains(&q)
-            })
-            .map(|t| t.index)
-            .collect();
+        self.rows = arc.textures.iter().filter(|t| matches(t, &q, self.show, self.show_unavailable)).map(|t| t.index).collect();
         let t = &arc.textures;
         match self.sort {
             Sort::Number => {}
@@ -397,8 +558,10 @@ impl App {
     fn cube_view(&mut self, ui: &egui::Ui, p: &egui::Painter, area: Rect, resp: &egui::Response, t: usize) {
         let vis = ui.visuals().clone();
         if self.cube3d.as_ref().is_none_or(|c| c.t != t) {
-            let view = self.cube3d.as_ref().map(|c| c.view).unwrap_or_default();
-            self.cube3d = Some(Cube3d { t, faces: None, error: None, view: crate::cube3d::View { sphere: view.sphere, z_up: view.z_up, ..Default::default() }, shown: None });
+            let sphere = self.cube3d.as_ref().is_some_and(|c| c.view.sphere);
+            let mut c = self.new_cube3d(t);
+            c.view.sphere = sphere;
+            self.cube3d = Some(c);
         }
         let Some(arc) = self.arc.clone() else { return };
         let c = self.cube3d.as_mut().unwrap();
@@ -455,6 +618,99 @@ impl App {
         p.text(area.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, hint, FontId::proportional(12.0), vis.text_color());
     }
 
+    /// Select texture `i` of the open archive and make sure the gallery shows it.
+    fn focus_texture(&mut self, i: usize) {
+        let Some(arc) = &self.arc else { return };
+        if i >= arc.textures.len() {
+            return;
+        }
+        let unavailable = matches!(arc.textures[i].status, Status::Unavailable(_));
+        if !matches(&arc.textures[i], &self.search.trim().trim_start_matches('#').to_lowercase(), self.show, self.show_unavailable) {
+            self.search.clear();
+            self.show = Show::All;
+            self.show_unavailable |= unavailable;
+        }
+        self.refresh_rows();
+        self.select_click(i, false, false);
+        self.scroll_to_focus = true;
+    }
+
+    /// The "Search all files" window.
+    fn search_window(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(dir) = self.folder.clone() else { return };
+        ui.label(format!("Every .ttpf in {}", dir.display()));
+        let running = self.fsearch.is_some();
+        let mut go = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.fquery).hint_text("number, 512x256, BC7 (empty: everything)").desired_width(220.0));
+            go |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            egui::ComboBox::from_id_salt("fshow").selected_text(self.fshow.name()).show_ui(ui, |ui| {
+                for s in Show::ALL {
+                    ui.selectable_value(&mut self.fshow, s, s.name());
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.funavailable, "Include unavailable");
+            go |= ui.add_enabled(!running, egui::Button::new("Search")).clicked();
+            if running && ui.button("Stop").clicked() {
+                if let Some(t) = &self.fsearch {
+                    t.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        if go && !running {
+            self.found = None;
+            self.fsearch = Some(crate::folder::search(dir.clone(), self.fquery.clone(), self.fshow, self.funavailable));
+        }
+        if let Some(t) = &self.fsearch {
+            ui.add(egui::ProgressBar::new(t.fraction()).text(format!("Searching file {}/{}", t.done.load(Ordering::Relaxed), t.total.load(Ordering::Relaxed))));
+        }
+        let Some(found) = &self.found else { return };
+        let mut info = format!("{} found in {} files", found.hits.len(), found.files);
+        if found.truncated {
+            info += &format!(" (only the first {} are listed)", crate::folder::MAX_HITS);
+        }
+        if found.failed > 0 {
+            info += &format!(", {} files couldn't be opened", found.failed);
+        }
+        ui.label(info);
+        ui.separator();
+        let mut pick = None;
+        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, found.hits.len(), |ui, range| {
+            for h in &found.hits[range] {
+                let file = h.path.file_name().unwrap_or_default().to_string_lossy();
+                let mut text = format!("{file}   #{}   {}x{}   {}", h.index, h.w, h.h, h.format);
+                if !h.note.is_empty() {
+                    text += &format!("   ({})", h.note);
+                }
+                let current = self.open_path.as_ref() == Some(&h.path) && self.focus == Some(h.index);
+                if ui.selectable_label(current, text).on_hover_text(h.path.display().to_string()).clicked() {
+                    pick = Some((h.path.clone(), h.index));
+                }
+            }
+        });
+        if let Some((path, i)) = pick {
+            if self.open_path.as_ref() == Some(&path) && self.arc.is_some() {
+                self.focus_texture(i);
+            } else {
+                self.open(path, ctx);
+                self.pending_focus = Some(i);
+            }
+        }
+    }
+
+    /// Extract every .ttpf of the sidebar folder.
+    fn extract_folder(&mut self) {
+        let Some(dir) = self.folder.clone() else { return };
+        let what = if self.as_dds { "DDS files" } else { "PNGs" };
+        let Some(out) = rfd::FileDialog::new().set_title(format!("Choose a folder for the {what}")).pick_folder() else { return };
+        let out = out.join(dir.file_name().unwrap_or_default());
+        self.message = None;
+        self.fexport = Some((crate::folder::extract_all(dir, out.clone(), self.as_dds), out));
+    }
+
     fn select_click(&mut self, t: usize, ctrl: bool, shift: bool) {
         if shift && self.anchor.is_some() {
             let a = self.rows.iter().position(|&r| Some(r) == self.anchor);
@@ -509,6 +765,40 @@ impl App {
             Ok(()) => (format!("Saved {}", path.display()), path.parent().map(|p| p.to_path_buf())),
             Err(e) => (format!("Couldn't save: {e}"), None),
         });
+    }
+
+    /// Copy a face / slice / mip level to the clipboard (decoded in the background).
+    fn copy(&mut self, t: usize, layer: usize, level: Option<usize>) {
+        let Some(arc) = self.arc.clone() else { return };
+        let done = self.done.clone();
+        self.message = Some(("Copying…".into(), None));
+        self.pool.push(Box::new(move || {
+            let img = match level {
+                Some(l) => arc.image_in(t, layer, l),
+                None => arc.best_image_in(t, layer),
+            };
+            let m = match img.map_err(|p| p.text().to_string()).and_then(|i| copy_image(&i).map(|_| (i.w, i.h))) {
+                Ok((w, h)) => format!("Copied #{t} ({w}x{h}) to the clipboard"),
+                Err(e) => format!("Couldn't copy: {e}"),
+            };
+            done.lock().unwrap().push(Done::Message(m, None));
+        }));
+    }
+
+    /// Save a cube map as a 360-degree panorama PNG.
+    fn save_panorama(&mut self, t: usize) {
+        let Some(arc) = self.arc.clone() else { return };
+        let Some(path) = rfd::FileDialog::new().set_file_name(format!("{t}_panorama.png")).add_filter("PNG image", &["png"]).save_file() else { return };
+        let (done, z_up) = (self.done.clone(), self.z_up);
+        self.message = Some(("Making panorama…".into(), None));
+        self.pool.push(Box::new(move || {
+            let r = arc.cube_faces(t).map_err(|p| p.text().to_string()).and_then(|f| archive::save_png(&crate::cube3d::panorama(&f, z_up), &path));
+            let m = match r {
+                Ok(()) => (format!("Saved {}", path.display()), path.parent().map(|p| p.to_path_buf())),
+                Err(e) => (format!("Couldn't save: {e}"), None),
+            };
+            done.lock().unwrap().push(Done::Message(m.0, m.1));
+        }));
     }
 
     fn save_dds(&mut self, t: usize) {
@@ -591,14 +881,25 @@ impl App {
                     _ if a == "unavailable" => self.show_unavailable = true,
                     _ if a == "light" => ctx.set_theme(egui::Theme::Light),
                     _ if a == "desc" => self.descending = true,
+                    Some(("show", v)) => self.show = Show::from_key(v),
+                    Some(("fsearch", q)) => {
+                        self.fwin = true;
+                        self.fquery = q.replace('+', " ");
+                        if let Some(d) = self.folder.clone() {
+                            self.fsearch = Some(crate::folder::search(d, self.fquery.clone(), self.fshow, false));
+                        }
+                    }
                     _ if a == "3d" => self.view3d = true,
                     _ if a == "yup" => {
                         let t = self.focus.unwrap_or(0);
-                        self.cube3d.get_or_insert_with(|| Cube3d { t, faces: None, error: None, view: Default::default(), shown: None }).view.z_up = false;
+                        let c = self.new_cube3d(t);
+                        self.cube3d.get_or_insert(c).view.z_up = false;
+                        self.z_up = false;
                     }
                     _ if a == "sphere" || a.starts_with("yaw=") => {
                         let t = self.focus.unwrap_or(0);
-                        let c = self.cube3d.get_or_insert_with(|| Cube3d { t, faces: None, error: None, view: Default::default(), shown: None });
+                        let c = self.new_cube3d(t);
+                        let c = self.cube3d.get_or_insert(c);
                         if a == "sphere" {
                             c.view.sphere = true;
                         } else {
@@ -619,6 +920,7 @@ impl App {
         }
         let busy = !self.pending.is_empty()
             || self.full_pending.is_some()
+            || self.fsearch.is_some()
             || (self.view3d && self.cube3d.as_ref().is_some_and(|c| c.faces.is_none() && c.error.is_none()));
         let settled = if busy { 1 } else { settled + 1 };
         self.test.as_mut().unwrap().2 = settled;
@@ -681,6 +983,16 @@ impl eframe::App for App {
             self.checker = Some(ctx.load_texture("checker", img, opts));
         }
         self.poll(&ctx);
+        if let Some(c) = &self.cube3d {
+            self.z_up = c.view.z_up;
+        }
+        if self.test.is_none() {
+            let now = self.settings();
+            if now != self.saved {
+                now.save();
+                self.saved = now;
+            }
+        }
         self.keys(&ctx);
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
@@ -697,9 +1009,35 @@ impl eframe::App for App {
                         }
                     });
                 });
+                ui.horizontal(|ui| {
+                    if ui.button("Search all…").on_hover_text("Find textures in every .ttpf of this folder").clicked() {
+                        self.fwin = true;
+                    }
+                    let what = if self.as_dds { "DDS" } else { "PNG" };
+                    if ui
+                        .add_enabled(self.fexport.is_none(), egui::Button::new("Extract all…"))
+                        .on_hover_text(format!("Save every readable texture of every .ttpf in this folder as {what} (PNG/DDS: the choice in the toolbar), one folder per file"))
+                        .clicked()
+                    {
+                        self.extract_folder();
+                    }
+                });
+                if let Some((t, _)) = &self.fexport {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::ProgressBar::new(t.fraction()).desired_width(150.0).text(format!("file {}/{}", t.done.load(Ordering::Relaxed), t.total.load(Ordering::Relaxed))));
+                        if ui.small_button("Stop").clicked() {
+                            t.cancel.store(true, Ordering::Relaxed);
+                        }
+                    });
+                }
                 ui.separator();
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.tree(ui, root.clone(), &ctx));
             });
+        }
+        if self.fwin && self.folder.is_some() {
+            let mut open = true;
+            egui::Window::new("Search all files").open(&mut open).default_size([560.0, 520.0]).show(&ctx, |ui| self.search_window(ui, &ctx));
+            self.fwin = open;
         }
         if self.focus.is_some() && self.arc.is_some() {
             egui::Panel::right("preview").resizable(true).default_size(540.0).min_size(340.0).show(ui, |ui| self.preview(ui));
@@ -768,6 +1106,17 @@ impl App {
                 "Textures that can't be shown: cut off from the file, stored with a compression this app can't read, or in an unsupported pixel format.",
             );
             ui.separator();
+            let counts: Vec<usize> = Show::ALL.iter().map(|s| self.arc.as_ref().map_or(0, |a| a.textures.iter().filter(|t| s.wants(t)).count())).collect();
+            egui::ComboBox::from_id_salt("show")
+                .width(150.0)
+                .selected_text(format!("Show: {}", self.show.name().to_lowercase()))
+                .show_ui(ui, |ui| {
+                    for (s, n) in Show::ALL.into_iter().zip(&counts) {
+                        if *n > 0 || s == Show::All {
+                            ui.selectable_value(&mut self.show, s, format!("{}  ({n})", s.name()));
+                        }
+                    }
+                });
             ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search: number, 512x256, BC7").desired_width(190.0));
             ui.separator();
             egui::ComboBox::from_id_salt("sort")
@@ -967,6 +1316,28 @@ impl App {
             let m = ui.input(|i| i.modifiers);
             self.select_click(t, m.command, m.shift);
         }
+        if !matches!(tex.status, Status::Unavailable(_)) {
+            let cube = tex.cube;
+            resp.context_menu(|ui| {
+                if ui.button("Copy image").clicked() {
+                    self.copy(t, 0, None);
+                    ui.close();
+                }
+                if ui.button("Save PNG…").clicked() {
+                    let l = arc.textures[t].status.shown_level().unwrap_or(0);
+                    self.save_one(t, 0, l);
+                    ui.close();
+                }
+                if ui.button("Save DDS…").clicked() {
+                    self.save_dds(t);
+                    ui.close();
+                }
+                if cube && ui.button("Save panorama…").clicked() {
+                    self.save_panorama(t);
+                    ui.close();
+                }
+            });
+        }
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -1022,7 +1393,8 @@ impl App {
                 ui.selectable_value(&mut self.view3d, false, "Faces");
                 ui.selectable_value(&mut self.view3d, true, "3D").on_hover_text("See the cube map in 3D");
                 if self.view3d {
-                    let view = &mut self.cube3d.get_or_insert_with(|| Cube3d { t, faces: None, error: None, view: Default::default(), shown: None }).view;
+                    let c = self.new_cube3d(t);
+                    let view = &mut self.cube3d.get_or_insert(c).view;
                     ui.separator();
                     ui.selectable_value(&mut view.sphere, false, "Look around").on_hover_text("From inside, like a sky");
                     ui.selectable_value(&mut view.sphere, true, "Sphere").on_hover_text("Wrapped on a ball");
@@ -1183,8 +1555,14 @@ impl App {
         ui.add_space(4.0);
         if let Some(l) = level {
             ui.horizontal(|ui| {
+                if ui.button("Copy").on_hover_text("Copy this image to the clipboard").clicked() {
+                    self.copy(t, self.layer, Some(l));
+                }
                 if ui.button("Save PNG…").clicked() {
                     self.save_one(t, self.layer, l);
+                }
+                if tex.cube && ui.button("Save panorama…").on_hover_text("The whole cube map as one 360° picture (2:1), for sky viewers and 3D programs").clicked() {
+                    self.save_panorama(t);
                 }
                 if ui.button("Save DDS…").on_hover_text("The original data: lossless, keeps the compression, HDR values and mip levels").clicked() {
                     self.save_dds(t);

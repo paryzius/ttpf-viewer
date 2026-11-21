@@ -5,8 +5,10 @@ mod archive;
 mod bc6h;
 mod bcn;
 mod cube3d;
+mod folder;
 mod gui;
 mod layout;
+mod settings;
 mod tile;
 
 use archive::{Archive, Progress, Status};
@@ -22,6 +24,8 @@ USAGE
   ttpf-viewer extract FILE.ttpf DIR   save every readable texture as DIR/<number>.png
         --dds          save .dds files with the original data instead
         --clip         HDR textures: clip values above white instead of tone-mapping
+  ttpf-viewer extract-folder DIR OUT  the same for every .ttpf under DIR, one folder per file (--dds, --clip)
+  ttpf-viewer panorama FILE.ttpf N OUT.png   save cube map #N as a 360-degree panorama (--y-up: Y is up)
   ttpf-viewer list FILE.ttpf          print the textures in the file
 ";
 
@@ -67,6 +71,38 @@ fn run_cli(args: &[String]) -> Result<(), String> {
                 *counts.entry(key).or_insert(0) += 1;
             }
             println!("\n{} textures: {:?}", arc.textures.len(), counts);
+            Ok(())
+        }
+        "extract-folder" if args.len() >= 3 => {
+            let t = folder::extract_all(PathBuf::from(&args[1]), PathBuf::from(&args[2]), args.iter().any(|a| a == "--dds"));
+            let r = loop {
+                if let Some(r) = t.take() {
+                    break r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }?;
+            println!("saved {} textures from {} files to {} ({} unreadable, {} files couldn't be opened)", r.written, r.files - r.failed, args[2], r.skipped, r.failed);
+            Ok(())
+        }
+        "panorama" if args.len() >= 4 => {
+            let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
+            let t: usize = args[2].parse().map_err(|_| "bad texture number")?;
+            if t >= arc.textures.len() || !arc.textures[t].cube {
+                return Err(format!("#{t} is not a cube map"));
+            }
+            let faces = arc.cube_faces(t).map_err(|p| p.text().to_string())?;
+            let img = cube3d::panorama(&faces, !args.iter().any(|a| a == "--y-up"));
+            archive::save_png(&img, &PathBuf::from(&args[3]))?;
+            println!("saved {}x{} panorama to {}", img.w, img.h, args[3]);
+            Ok(())
+        }
+        // development aid, not in the help: copy a texture to the clipboard
+        "copy" if args.len() >= 3 => {
+            let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
+            let t: usize = args[2].parse().map_err(|_| "bad texture number")?;
+            let img = arc.best_image(t).map_err(|p| p.text().to_string())?;
+            gui::copy_image(&img)?;
+            println!("copied {}x{}", img.w, img.h);
             Ok(())
         }
         // development aid, not in the help: a checksum of every texture's shown image, to compare builds
@@ -135,7 +171,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "extract" || a == "list" || a == "checksums" || a == "mipcheck" || a == "dump-raw" || a == "--help" || a == "-h") {
+    if args.first().is_some_and(|a| a == "extract" || a == "list" || a == "checksums" || a == "mipcheck" || a == "extract-folder" || a == "panorama" || a == "copy" || a == "dump-raw" || a == "--help" || a == "-h") {
         attach_console();
         if let Err(e) = run_cli(&args) {
             eprintln!("{e}");
