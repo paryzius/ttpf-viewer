@@ -188,6 +188,8 @@ struct Loading {
 }
 
 pub struct App {
+    notes_open: bool,
+    notes_platform: Option<archive::Platform>,
     pool: Arc<Pool>,
     done: Arc<Mutex<Vec<Done>>>,
     arc: Option<Arc<Archive>>,
@@ -317,6 +319,8 @@ impl App {
     fn blank(file: Option<PathBuf>) -> App {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         App {
+            notes_open: false,
+            notes_platform: None,
             pool: Pool::new(threads),
             done: Arc::new(Mutex::new(Vec::new())),
             arc: None,
@@ -382,6 +386,10 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if path.is_dir() {
+            self.set_folder(path);
+            return;
+        }
         if !archive::is_ttpf_name(&path) {
             self.message = Some((format!("{} is not a .ttpf file.", path.file_name().unwrap_or_default().to_string_lossy()), None));
             return;
@@ -420,11 +428,7 @@ impl App {
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if let Some(p) = dropped.into_iter().find(|p| !p.as_os_str().is_empty()) {
-            if p.is_dir() {
-                self.set_folder(p);
-            } else {
-                self.open(p, ctx);
-            }
+            self.open(p, ctx);
         }
         let loaded = self.loading.as_ref().and_then(|l| l.result.lock().unwrap().take());
         if let Some(r) = loaded {
@@ -1027,6 +1031,7 @@ impl App {
                     Some(("level", n)) => self.level = n.parse().ok(),
                     Some(("layer", n)) => self.layer = n.parse().unwrap_or(0),
                     Some(("folder", d)) => self.set_folder(PathBuf::from(d)),
+                    _ if a == "notes" => self.notes_open = true,
                     Some(("size", n)) => self.tsize = n.parse().unwrap_or(self.tsize),
                     _ if a == "unavailable" => self.show_unavailable = true,
                     _ if a == "light" => ctx.set_theme(egui::Theme::Light),
@@ -1153,6 +1158,37 @@ impl eframe::App for App {
         self.keys(&ctx);
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if self.notes_open {
+            egui::Window::new("Format notes").open(&mut self.notes_open).default_width(510.0).show(&ctx, |ui| {
+                use archive::Platform::{Ps5, Xbox};
+                ui.horizontal(|ui| {
+                    for (value, label) in [(None, "Both"), (Some(Xbox), "Xbox"), (Some(Ps5), "PS5")] {
+                        ui.selectable_value(&mut self.notes_platform, value, label);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (platform, notes) in [
+                        (None, include_str!("../docs/shared.md")),
+                        (Some(Xbox), include_str!("../docs/xbox.md")),
+                        (Some(Ps5), include_str!("../docs/ps5.md")),
+                    ] {
+                        if platform.is_some() && self.notes_platform.is_some() && self.notes_platform != platform {
+                            continue;
+                        }
+                        for paragraph in notes.lines().filter(|line| !line.is_empty()) {
+                            if let Some(title) = paragraph.strip_prefix("# ") {
+                                ui.heading(title);
+                            } else {
+                                ui.label(paragraph);
+                                ui.add_space(4.0);
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
+                });
+            });
+        }
         if let Some(root) = self.folder.clone() {
             egui::Panel::left("folder").resizable(true).default_size(260.0).min_size(160.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1254,6 +1290,10 @@ impl App {
             }
             if let Some(a) = &self.arc {
                 ui.label(RichText::new(a.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).strong());
+                ui.label(a.platform.name());
+            }
+            if ui.button("Format notes").clicked() {
+                self.notes_open = true;
             }
             if self.arc.is_none() {
                 return;
@@ -1331,7 +1371,7 @@ impl App {
                 .selected_text(if self.as_dds { "DDS" } else { "PNG" })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.as_dds, false, "PNG");
-                    ui.selectable_value(&mut self.as_dds, true, "DDS").on_hover_text("The original data: lossless, keeps the compression, HDR values and mip levels");
+                    ui.selectable_value(&mut self.as_dds, true, "DDS").on_hover_text("Preserves the decoded texture blocks, HDR values and mip levels");
                 });
             let n_sel = self.selected.len();
             if ui.add_enabled(n_sel > 0 && !busy, egui::Button::new(format!("Extract selected ({n_sel})"))).clicked() {
@@ -1540,7 +1580,7 @@ impl App {
         match tex.status {
             Status::Full => {}
             Status::Reduced(_) => {
-                ui.colored_label(vis.warn_fg_color, "Full size is stored with a compression this app can't read; showing the largest readable mip level.");
+                ui.colored_label(vis.warn_fg_color, "Showing the largest readable mip level. The full-size level is unavailable.");
             }
             Status::Unavailable(prob) => {
                 ui.colored_label(vis.warn_fg_color, format!("Can't show this texture: {}.", prob.text()));
@@ -1703,6 +1743,11 @@ impl App {
             ui.label("Format");
             ui.label(format!("{}  ({} tiles)", tex.format_name(), tex.tile.name()));
             ui.end_row();
+            if level.and_then(|i| levels.get(i)).is_some_and(|l| l.bcpack) {
+                ui.label("Storage");
+                ui.label("Xbox BCPack");
+                ui.end_row();
+            }
             if let Some(l) = level {
                 ui.label("Showing");
                 let what = if tex.layer_count() > 1 { format!("{}, ", tex.layer_name(layer)) } else { String::new() };
@@ -1746,7 +1791,7 @@ impl App {
                 if tex.cube && ui.button("Save panorama…").on_hover_text("The whole cube map as one 360° picture (2:1), for sky viewers and 3D programs").clicked() {
                     self.save_panorama(t);
                 }
-                if ui.button("Save DDS…").on_hover_text("The original data: lossless, keeps the compression, HDR values and mip levels").clicked() {
+                if ui.button("Save DDS…").on_hover_text("Preserves the decoded texture blocks, HDR values and mip levels").clicked() {
                     self.save_dds(t);
                 }
             });

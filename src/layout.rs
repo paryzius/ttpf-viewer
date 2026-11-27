@@ -47,7 +47,7 @@ pub fn chain(fmt: Fmt, tile: Tile, w: usize, h: usize, mips: usize) -> Option<Ch
     let (tw, th) = fmt.tile_px(tile);
     let (bw, bh) = (tw / b, th / b); // tile size in elements
     let tile_bytes = bw * bh * bytes;
-    let max_in_tail = if tile == Tile::T64K { 12 } else { 8 };
+    let max_in_tail = if tile == Tile::T4K { 8 } else { 12 };
     let px = |i: usize| ((w >> i).max(1), (h >> i).max(1));
     let el = |i: usize| (px(i).0.div_ceil(b), px(i).1.div_ceil(b));
     let tail = if mips > 1 {
@@ -111,7 +111,7 @@ pub fn cube_copies(c: &Chain, copies: usize) -> Option<(usize, usize)> {
     for k in 0..copies {
         let n = u - copies + 1 + k;
         let mut size = 6 * c.units[..n].iter().sum::<usize>();
-        if size > 128 << 10 {
+        if copies > 1 && size > 128 << 10 {
             size = size.div_ceil(64 << 10) * (64 << 10);
         }
         if k == copies - 1 {

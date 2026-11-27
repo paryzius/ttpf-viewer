@@ -21,6 +21,7 @@ ttpf-viewer - browse and extract textures from .ttpf archives
 USAGE
   ttpf-viewer                         open the app
   ttpf-viewer FILE.ttpf               open the app with a file
+  ttpf-viewer DIR                     browse an installation or archive folder
   ttpf-viewer extract FILE.ttpf DIR   save every readable texture as DIR/<number>.png
         --dds          save .dds files with the original data instead
         --clip         HDR textures: clip values above white instead of tone-mapping

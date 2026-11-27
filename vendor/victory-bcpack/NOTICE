@@ -1,0 +1,8 @@
+The Rust decoder in bcpack.rs comes from VIctory's victory-formats crate,
+revision fbf875e0730d3e8e9bd5dcf8054bac2e84e1227a. Its source license
+is GPL-3.0-or-later. See LICENSE in this directory.
+https://github.com/Marvisak/VIctory/tree/fbf875e0730d3e8e9bd5dcf8054bac2e84e1227a/crates/victory-formats/src
+
+bcpack-tables.bin contains the format constants supplied with that revision.
+VIctory explicitly excludes this file from its source license.
+https://github.com/Marvisak/VIctory/blob/fbf875e0730d3e8e9bd5dcf8054bac2e84e1227a/docs/asset-policy.md

@@ -86,15 +86,15 @@ pub fn linear(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<V
         }
         return Some(first.repeat(n));
     }
-    Some(tile::untile(&data[..n * bytes], bytes, we, he, pat))
+    Some(tile::untile(&data[..n * bytes], bytes, we, he, tile))
 }
 
-pub fn decode(data: &[u8], fmt: Fmt, w: usize, h: usize, tile: Tile) -> Option<Rgba> {
-    let lin = linear(data, fmt, w, h, tile)?;
+pub fn decode_linear(lin: &[u8], fmt: Fmt, w: usize, h: usize) -> Option<Rgba> {
     let (b, bytes) = (fmt.block(), fmt.bytes());
     let (we, he) = (w / b, h / b);
+    if lin.len() != we * he * bytes { return None; }
     if b == 1 {
-        return Some(Rgba { w, h, px: pixels(&lin, fmt) });
+        return Some(Rgba { w, h, px: pixels(lin, fmt) });
     }
     let mut px = vec![0u8; w * h * 4];
     let mut blk = [0u32; 16];

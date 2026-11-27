@@ -1,15 +1,14 @@
 # TTPF Viewer
 
-A fast viewer and extractor for the textures inside `.ttpf` texture archives. Drop a file in and browse
+A viewer and extractor for Xbox Series and PS5 `.ttpf` texture archives. Drop a file in and browse
 thousands of textures at once, look at any of them up close, and save them as PNG or DDS.
 
 ![TTPF Viewer: a gallery of light textures, with a cube map shown on a 3D sphere](docs/screenshot.png)
 
-- **Exact decoding**: format, size, GPU tile layout and mip levels come straight from the archive's header,
-  with no guessing
+- **Automatic platform detection** for Xbox RDS5 and PS5 standalone ETPF, with platform-specific 64 KiB tile layouts
 - **All common formats**: BC1 to BC7, HDR (BC6H, half-float) and uncompressed
 - **Cube maps and texture arrays**, with a 3D view and 360° panorama export
-- **Export** as PNG, or as DDS with the original data (lossless, mip levels included)
+- **Export** as PNG, or as DDS with the decoded BC blocks, HDR values and mip levels
 - **Whole folders**: browse them in a sidebar, search every archive at once, extract everything in one go
 - **Fast**: multi-gigabyte archives open instantly; textures are only unpacked when shown
 
@@ -59,7 +58,7 @@ The app follows your system's light or dark theme:
 | | |
 |---|---|
 | **PNG** | what you see, as `<number>.png` |
-| **DDS** | the original data: lossless, with its compression, HDR values and mip levels. Choose **DDS** next to the Extract buttons, or **Save DDS…** for one texture |
+| **DDS** | the decoded blocks or texels, including HDR values and mip levels. Choose **DDS** next to the Extract buttons, or **Save DDS…** for one texture |
 | **Panorama** | a cube map as one 360° picture (2:1), the format sky viewers and 3D programs use |
 | **Copy** | right-click a texture, or **Copy** under the preview, to put it on the clipboard |
 | **Whole folder** | **Extract all…** in the folder sidebar: every archive into its own folder |
@@ -80,21 +79,17 @@ Settings (sort, filter, thumbnail size, HDR, PNG/DDS, 3D up axis and the open fo
 | Esc | clear the selection and close the preview |
 | Right-click | copy, save PNG, DDS or panorama |
 
-## What it can't show
+## Texture support
 
-- **BCPack**: some parts of these archives use BCPack, the Xbox hardware texture compression, which has no
-  public decoder. When only the full-size level is stored that way, the largest readable mip level is shown
-  instead, marked "(only WxH)". Otherwise the texture is unavailable; tick **Show unavailable** to list it anyway.
-- **Cut-off files**: parts missing from a partly downloaded archive.
-- **Unsupported formats**: any not in the list below. None of the archives seen so far use one.
+The viewer reads BC1, BC2, BC3, BC4, BC5, BC6H (unsigned and signed), BC7, R8, A8, R16_FLOAT, RGBA8, BGRA8 and RGBA16 (UNORM and FLOAT). Xbox BCPack covers BC1, BC3, BC4, BC5, BC6H and BC7. Block reconstruction and its verification are described in the [Xbox notes](docs/xbox.md).
 
-Supported formats: BC1, BC2, BC3, BC4, BC5, BC6H (unsigned and signed), BC7, R8, A8, R16_FLOAT (shown as grey,
-scaled to its own range, e.g. heightmaps), R8G8B8A8, B8G8R8A8, R16G16B16A16 (UNORM and FLOAT).
+A partly downloaded archive may still contain smaller mips. The viewer shows the largest available level and its dimensions. **Show unavailable** also lists entries with missing data, unsupported formats or unknown layouts.
 
 ## Command line
 
 ```
 ttpf-viewer FILE.ttpf                      open a file in the app
+ttpf-viewer DIR                            browse an installation folder
 ttpf-viewer extract FILE.ttpf OUTDIR       save every readable texture as OUTDIR/<number>.png
 ttpf-viewer extract-folder DIR OUTDIR      the same for every .ttpf under DIR, one folder per file
 ttpf-viewer panorama FILE.ttpf N OUT.png   save cube map #N as a 360° panorama
@@ -104,35 +99,13 @@ ttpf-viewer list FILE.ttpf                 print the textures in the file
 Options: `--dds` saves DDS instead of PNG, `--clip` clips HDR textures instead of tone-mapping them, and `--y-up`
 (for `panorama`) treats Y as up.
 
-## The format
+## Format notes
 
-```text
-0x00  "RDS5"
-0x04  u32  number of blocks
-0x08  u32  total size of the unpacked data (low 32 bits; bits 32-39 are in the low byte of 0x0C)
-0x10  u32  position of the ETPF section / 256
-0x18  u64 per block:  bits  0-25  where the block ends in the file / 256
-                      bits 26-29  how the NEXT block is stored: 0 = as-is, 1-7 = BCPack, 8 = zlib
-                      bits 30-51  where the block ends in the unpacked data / 4096
-      (the first block starts at the ETPF position and holds the ETPF section, stored as-is)
-then, at the ETPF position:
-      "ETPF", u32 ?, u32 number of textures, u32 section size
-      16 bytes per texture:
-        dword0  bits  0-13 width-1, 14-27 height-1, 28-31 mip levels - 1 (cube maps: mip levels)
-        dword1  bits  0-9  DXGI format << 3 | flags, bits 10-19 array size - 1,
-                bits 24-27 tile mode (0 = 64 KB tiles, 1-3 = 4 KB, 9-12 = 4 KB cube maps)
-        dword2  bits  0-20 start of the texture in the unpacked data / 4096
-      then a sorted list of 8-byte name hashes
-```
+Open **Format notes** in the toolbar. **Both** shows the shared descriptor layout and both platform sections. **Xbox** and **PS5** show the shared layout and the selected platform's storage details. The same text is available here.
 
-The blocks are consecutive chunks of one unpacked stream. Each texture is a contiguous run of that stream
-holding its mip levels smallest first; the full-size level ends where the next texture starts. Pixel data is
-stored in AMD's standard tile order; the tile patterns are in [`src/tile.rs`](src/tile.rs).
-
-Mip levels follow AMD's Gfx10 layout: smallest first, each in whole tiles, except that the smallest levels share
-one "mip tail" tile at fixed spots ([`src/layout.rs`](src/layout.rs)). Texture arrays store level by level, each
-level's slices back to back. Cube maps (tile modes 9-12) store tile mode - 8 complete cubes of growing size, the
-full-size one last.
+| Both platforms | Xbox | PS5 |
+| --- | --- | --- |
+| [ETPF descriptors, mip levels and exports](docs/shared.md) | [RDS5 chunks, BCPack codecs and reconstruction](docs/xbox.md) | [Direct ETPF, alignment and GPU tiles](docs/ps5.md) |
 
 ## Building from source
 
@@ -148,6 +121,8 @@ xkbcommon development packages (`sudo apt install libgtk-3-dev libxkbcommon-dev`
 For development, `TTPF_VIEWER_TEST="out.png;select=12,level=1,light"` makes the app open the given file, apply
 the actions, save a screenshot of its own window to `out.png` and quit.
 
+Run `cargo test --release --locked` for self-contained tests. To check local installations, set `TTPF_XBOX_ROOT` and `TTPF_PS5_ROOT` and run `cargo test --release --locked -- --ignored --nocapture`. The install tests read both directories, compare selected previews and complete DDS payloads, and decode every Xbox BCPack chunk. The full comparison requires matching game builds.
+
 ## Credits
 
 - [egui / eframe](https://github.com/emilk/egui) for the interface
@@ -159,8 +134,11 @@ the actions, save a screenshot of its own window to `out.png` and quit.
 - [Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars) and [PercyStar](https://github.com/rpatty-dev/PercyStar)
   (by rpatty-dev), whose research showed how the block table encodes block ends and storage types, and
   [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) for the descriptor fields and the cube map
-  and array layouts. This app's code is its own.
+  and array layouts.
+- This repository includes VIctory’s Xbox BCPack decoder and fixed format tables. Cargo builds the decoder from the local source and embeds the table in the executable. [Vendored decoder and tables](vendor/victory-bcpack) · [Upstream revision and license notice](vendor/victory-bcpack/NOTICE)
+- SixNG supplies the 3D volume layout and the BC6H field layouts used to verify the decoder. The tests use the bcpack-rs encoder to generate streams and its decoder for independent BC3, BC4, BC5 and BC7 comparisons. [SixNG](https://github.com/holdmysocks/SixNG) · [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs)
+- [ttpf-spec](https://github.com/BaptistSec/ttpf-spec/blob/main/SPEC.md) compares community RDS5 and ETPF field descriptions. The [reverse-engineering index](https://github.com/Ahmet-Dedeler/awesome-gta6-reverse-engineering) links the related format research.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+The original viewer source retains its [MIT license](LICENSE). The combined executable links SixNG and the vendored VIctory decoder and uses [GPL-3.0-only](COPYING) for its code. bcpack-rs is available under MIT or Apache-2.0. VIctory excludes the BCPack table data from its source license. [Vendored license notice](vendor/victory-bcpack/NOTICE)

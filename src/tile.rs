@@ -8,6 +8,8 @@
 pub enum Tile {
     /// 64 KB tiles
     T64K,
+    /// PS5 64 KB standard swizzle (Xbox mode zero uses display swizzle).
+    Ps5T64K,
     /// 4 KB tiles
     T4K,
 }
@@ -15,7 +17,7 @@ pub enum Tile {
 impl Tile {
     pub fn name(self) -> &'static str {
         match self {
-            Tile::T64K => "64 KB",
+            Tile::T64K | Tile::Ps5T64K => "64 KB",
             Tile::T4K => "4 KB",
         }
     }
@@ -24,6 +26,11 @@ impl Tile {
     /// 4 (RGBA8/BGRA8 pixels), 2 (R16F pixels), 1 (R8/A8 pixels). Each was checked against decoded textures.
     pub fn pattern(self, bytes: usize) -> &'static str {
         match (self, bytes) {
+            (Tile::Ps5T64K, 16) => "yyxxyxyxyxyx",
+            (Tile::Ps5T64K, 8) => "xyyxxyxyxyxyx",
+            (Tile::Ps5T64K, 4) => "xxyyyxyxyxyxyx",
+            (Tile::Ps5T64K, 2) => "xxxyyyxyxyxyxyx",
+            (Tile::Ps5T64K, 1) => "xxxxyyyyyxyxyxyx",
             (Tile::T64K, 16) => "xyxyyxyxyxyx",
             (Tile::T4K, 16) => "yyxxyxyx",
             (Tile::T64K, 8) => "xyxxyyxyxyxyx",
@@ -56,9 +63,9 @@ pub fn tile_elems(pattern: &str) -> (usize, usize) {
 
 /// Rearrange tiled elements into a linear `w` x `h` grid. Elements that land outside are dropped,
 /// cells nobody fills stay zero.
-pub fn untile(data: &[u8], bytes: usize, w: usize, h: usize, pattern: &str) -> Vec<u8> {
+pub fn untile(data: &[u8], bytes: usize, w: usize, h: usize, tile: Tile) -> Vec<u8> {
     let n = data.len() / bytes;
-    let t = truncated(pattern, n).as_bytes();
+    let t = truncated(tile.pattern(bytes), n).as_bytes();
     let tile_len = 1usize << t.len();
     let mut lx = vec![0usize; tile_len];
     let mut ly = vec![0usize; tile_len];
@@ -75,7 +82,10 @@ pub fn untile(data: &[u8], bytes: usize, w: usize, h: usize, pattern: &str) -> V
             }
         }
         lx[j] = x;
-        ly[j] = y;
+        // The 8-bit Xbox display equation orders Y1 before Y0.
+        ly[j] = if tile == Tile::T64K && bytes == 1 {
+            (y & !3) | ((y & 1) << 1) | ((y & 2) >> 1)
+        } else { y };
     }
     let xs = t.iter().filter(|&&c| c == b'x').count();
     let (tw, th) = (1usize << xs, 1usize << (t.len() - xs));
